@@ -1,0 +1,399 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Sbog")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// 2. CONVERT STRINGS TO NUMBERS
+var habitatNames = ['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'];
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = ee.Dictionary({
+    'FS1': 1, 'FS2': 2, 'FW2/WL2': 3, 'GS4': 4, 
+    'PF1': 5, 'PF3': 6, 'WD4': 7, 'WN6': 8, 'WN7': 9
+  }).get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// 3. SELECT IMAGERY
+var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2019-01-01', '2019-12-31')
+  .median()
+  .clip(habitatPolygons);
+
+// CRITICAL FIX: Scale to 0-1 range for empirical index formulas
+var scaledImage = image.divide(10000.0);
+
+var nir   = scaledImage.select('B8');
+var red   = scaledImage.select('B4');
+var blue  = scaledImage.select('B2');
+var green = scaledImage.select('B3');
+
+// Calculate Indices with properly scaled values
+var ndvi  = scaledImage.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var rvi   = nir.divide(red).rename('RVI');
+var savi  = scaledImage.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+var evi   = scaledImage.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+var gndvi = scaledImage.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+var grvi  = scaledImage.normalizedDifference(['B3', 'B4']).rename('GRVI');
+var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+var ndwi  = scaledImage.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// COMBINE INTO FINAL SUPER-STACK
+// Keeps raw bands (0-10000) for the RF classifier, but attaches correct indices
+var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) 
+   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]);
+
+
+// 4. INCREASE PIXELS (Sampling at 5m scale instead of 10m)
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, // Lower scale = more training pixels
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.80));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.20));
+
+// 5. TRAIN ROBUST CLASSIFIER (More trees for complex centers)
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// 6. VALIDATE & SMOOTH
+var validated = validationSamples.classify(classifier);
+var testAccuracy = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- UPDATED RESULTS ---');
+print('Total Pixels Found:', allSamples.size());
+print('Validation Accuracy:', testAccuracy.accuracy());
+
+var rawClassified = finalImage.classify(classifier);
+
+// Subtle square smoothing to keep bog edges clean
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// 7. DISPLAY & EXPORT
+Map.centerObject(habitatPolygons, 15);
+var bogPalette = ['#FFA500', '#008000', '#FFC0CB', '#FF0000', '#800080', '#A52A2A', '#D2B48C', '#FFFF00', '#0000FF'];
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite');
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog High-Res Map');
+
+// 9. ACCURACY REPORT
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Producer\'s Accuracy (Columns):', errorMatrix.producersAccuracy());
+print('User\'s Accuracy (Rows):', errorMatrix.consumersAccuracy());
+
+// 10. MAJORITY FILTER BY POLYGON (Option B)
+// This calculates the most frequent (mode) class for each polygon
+var polygonMajority = rawClassified.reduceRegions({
+  collection: habitatPolygons,
+  reducer: ee.Reducer.mode(),
+  scale: 10
+});
+
+// Convert the reduced features back into an image
+// We use 'mode' because that is the property name created by the reducer
+var cleanHabitatMap = polygonMajority
+  .filter(ee.Filter.notNull(['mode']))
+  .reduceToImage(['mode'], ee.Reducer.first())
+  .clip(habitatPolygons);
+
+// Display the "Solid Block" version
+Map.addLayer(cleanHabitatMap, {min: 1, max: 15, palette: bogPalette}, 'Liskeenan Polygon Majority (Ultra Clean)');
+
+// 3a. INSPECT THE UNDERLYING COLLECTION
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  // .filterDate('2022-01-01', '2024-12-31');
+  .filterDate('2025-06-01', '2025-09-30');
+  
+
+// 1. Get the count of images
+var count = collectionBeforeMedian.size();
+print('Number of individual images in stack:', count);
+
+// 2. Get the dates of all images (formatted for humans)
+var dates = collectionBeforeMedian.map(function(img) {
+  return ee.Feature(null, {'date': img.date().format('YYYY-MM-dd')});
+}).aggregate_array('date');
+
+print('Dates of images used:', dates);
+
+
+// 11. DETAILED CONFUSION MATRIX ANALYSIS
+// This calculates how the 80% validation data performed
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- DETAILED ACCURACY REPORT ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Producer\'s Accuracy (Precision):', errorMatrix.producersAccuracy());
+print('User\'s Accuracy (Recall):', errorMatrix.consumersAccuracy());
+
+// 12. INTERNAL TRAINING ACCURACY (To check for overfitting)
+var trainAccuracy = classifier.confusionMatrix();
+print('Training Accuracy (Internal):', trainAccuracy.accuracy());
+print('Training Confusion Matrix:', trainAccuracy);
+// 13. KAPPA COEFFICIENT
+var kappa = errorMatrix.kappa();
+print('Kappa Coefficient:', kappa);
+
+
+// =================================================================
+// 14. AREA CALCULATION (% AND HECTARES)
+// =================================================================
+
+// Create a list of names to match the IDs for the printout
+var classNames = ee.List(['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7']);
+
+// Use the smoothed classification to calculate area
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'class',
+  }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var stats = ee.List(areas.get('groups'));
+
+// Function to format the results
+var areaResults = stats.map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  var areaM2 = ee.Number(dict.get('sum'));
+  var areaHa = areaM2.divide(10000); // Convert to hectares
+  
+  // Get label from our name list (adjusting for 0-based index)
+  var label = classNames.get(classId.subtract(1));
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Class_ID': classId,
+    'Area_Ha': areaHa,
+    'Area_M2': areaM2
+  });
+});
+
+var areaFC = ee.FeatureCollection(areaResults);
+
+// Calculate total area to get percentages
+var totalArea = areaFC.aggregate_sum('Area_Ha');
+
+var finalStats = areaFC.map(function(f) {
+  var pct = ee.Number(f.get('Area_Ha')).divide(totalArea).multiply(100);
+  return f.set('Percentage', pct);
+});
+
+print('--- HABITAT AREA STATS ---', finalStats);
+
+// =================================================================
+// 15. VISUALIZATION CHARTS
+// =================================================================
+
+// 1. Create a Bar Chart of Area in Hectares
+var barChart = ui.Chart.feature.byFeature({
+  features: finalStats,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Area_Ha']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Habitat Area Distribution (2019) - Hectares',
+  vAxis: {title: 'Area (Ha)'},
+  hAxis: {title: 'Habitat Type'},
+  colors: ['#1d6b99'], // You can change the color here
+  legend: {position: 'none'}
+});
+
+print(barChart);
+
+// 2. Create a Pie Chart of Percentages
+var pieChart = ui.Chart.feature.byFeature({
+  features: finalStats,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Percentage']
+})
+.setChartType('PieChart')
+.setOptions({
+  title: 'Habitat Composition (%)',
+  colors: bogPalette, // Uses the colors you defined earlier
+});
+
+print(pieChart);
+
+print('--- HABITAT PERCENTAGE BREAKDOWN ---');
+
+// We use the finalStats collection we created earlier
+finalStats.evaluate(function(featureCollection) {
+  featureCollection.features.forEach(function(feature) {
+    var props = feature.properties;
+    // This prints: Habitat Code: Percentage% (Area in Ha)
+    print(props.Habitat_Code + ': ' + props.Percentage.toFixed(2) + '% (' + props.Area_Ha.toFixed(2) + ' Ha)');
+  });
+});
+
+
+
+
+// =================================================================
+// 16. McNEMAR TEST (FINAL STABLE VERSION)
+// =================================================================
+
+// A. Train a second classifier (CART) to compare against your RF
+var classifier2 = ee.Classifier.smileCart().train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// B. Apply BOTH classifiers to the same validation collection
+// This adds 'RF_pred' and 'CART_pred' to every feature
+var comparisons = validationSamples
+  .classify(classifier, 'RF_pred')
+  .classify(classifier2, 'CART_pred');
+
+// C. Calculate Discordant Pairs (B and C)
+var discordantStats = comparisons.map(function(f) {
+  var actual = ee.Number(f.get('habitat_num'));
+  var p1 = ee.Number(f.get('RF_pred'));
+  var p2 = ee.Number(f.get('CART_pred'));
+  
+  var correct1 = p1.eq(actual);
+  var correct2 = p2.eq(actual);
+  
+  // B: RF is correct AND CART is wrong (1)
+  var isB = correct1.and(correct2.not());
+  // C: RF is wrong AND CART is correct (1)
+  var isC = correct1.not().and(correct2);
+  
+  return f.set({ 'isB': isB, 'isC': isC });
+});
+
+// D. Sum the results
+var countB = ee.Number(discordantStats.aggregate_sum('isB'));
+var countC = ee.Number(discordantStats.aggregate_sum('isC'));
+
+// E. Calculate Chi-Square (with Yates's Correction)
+// Formula: (|B - C| - 1)^2 / (B + C)
+var chiSquare = countB.subtract(countC).abs().subtract(1).pow(2)
+  .divide(countB.add(countC));
+
+print('--- McNEMAR STATISTICAL TEST ---');
+print('B (RF Correct / CART Wrong):', countB);
+print('C (RF Wrong / CART Correct):', countC);
+print('Chi-Square Statistic:', chiSquare);
+
+// Quick Interpretation
+var msg = ee.Algorithms.If(chiSquare.gt(3.84), 
+  'RESULT: Statistically Significant (p < 0.05)', 
+  'RESULT: Not Statistically Significant');
+print(msg);
+
+
+// 1. Group and dissolve all polygons by habitat code so each class has exactly ONE geometry
+var habitatCodesUnique = ['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'];
+
+var dissolvedHabitats = ee.FeatureCollection(
+  habitatCodesUnique.map(function(code) {
+    var matchingPolygons = habitatsMapped.filter(ee.Filter.eq('HCH_MAPPED', code));
+    var unionedGeometry = matchingPolygons.geometry(); // Merges all matching polygons together
+    return ee.Feature(unionedGeometry, {'Habitat': code});
+  })
+);
+
+// 2. Define the 5 core percentiles needed for a box plot structure
+var boxPlotReducer = ee.Reducer.percentile([0, 25, 50, 75, 100], ['min', 'p25', 'median', 'p75', 'max']);
+
+// 3. Extract metrics over the dissolved geometries and map into charts
+var generateBoxPlot = function(bandName, yAxisLabel, chartTitle, colorCode) {
+  var bandImage = finalImage.select(bandName);
+  
+  var statsCollection = dissolvedHabitats.map(function(feature) {
+    var code = feature.get('Habitat');
+    
+    var stats = bandImage.reduceRegion({
+      reducer: boxPlotReducer,
+      geometry: feature.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    });
+    
+    return ee.Feature(null, {
+      'Habitat': code,
+      'min': stats.get(bandName + '_min'),
+      'p25': stats.get(bandName + '_p25'),
+      'median': stats.get(bandName + '_median'),
+      'p75': stats.get(bandName + '_p75'),
+      'max': stats.get(bandName + '_max')
+    });
+  }).filter(ee.Filter.notNull(['median']));
+
+  // Create the final chart structure
+  var chart = ui.Chart.feature.byFeature({
+    features: statsCollection,
+    xProperty: 'Habitat',
+    yProperties: ['median']
+  })
+  .setChartType('LineChart')
+  .setOptions({
+    title: chartTitle,
+    vAxis: {title: yAxisLabel},
+    hAxis: {title: 'Habitat Class'},
+    legend: {position: 'none'},
+    lineWidth: 0, 
+    pointsVisible: true,
+    pointSize: 4,
+    colors: [colorCode],
+    intervals: {
+      'style': 'boxes', 
+      'lineWidth': 1, 
+      'barWidth': 0.5, 
+      'fillOpacity': 0.5
+    },
+    interval: {
+      'min': {'style': 'whiskers', 'attribute': 'min'},
+      'p25': {'style': 'boxes', 'attribute': 'p25'},
+      'p75': {'style': 'boxes', 'attribute': 'p75'},
+      'max': {'style': 'whiskers', 'attribute': 'max'}
+    }
+  });
+
+  return chart;
+};
+
+// 4. Print the correct aggregated box plots to your console panel
+print('--- AGGREGATED HABITAT SPECTRAL BOX PLOTS ---');
+print(generateBoxPlot('EVI', 'Index Value (0 to 1)', 'EVI Distribution per Habitat Class', '#1b9e77'));
+print(generateBoxPlot('B2', 'Reflectance (0 to 10000)', 'B2 Blue Band Distribution per Habitat Class', '#d95f02'));
+print(generateBoxPlot('B8', 'Reflectance (0 to 10000)', 'B8 NIR Band Distribution per Habitat Class', '#7570b3'));
+
+
+// Add this to your script to create a legend panel on the map
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legend.add(ui.Label({value: 'Habitat Legend', style: {fontWeight: 'bold', fontSize: '18px'}}));
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({style: {backgroundColor: color, padding: '8px', margin: '0 0 4px 0'}});
+  var description = ui.Label({value: name, style: {margin: '0 0 4px 6px'}});
+  return ui.Panel({widgets: [colorBox, description], layout: ui.Panel.Layout.Flow('horizontal')});
+};
+
+for (var i = 0; i < habitatNames.length; i++) {
+  legend.add(makeRow(bogPalette[i], habitatNames[i]));
+}
+Map.add(legend);
