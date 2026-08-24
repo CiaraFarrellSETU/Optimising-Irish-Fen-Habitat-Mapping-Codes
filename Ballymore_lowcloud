@@ -1,0 +1,140 @@
+// 1. IMPORT ASSET
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Ballymore");
+
+// 2. CONVERT STRINGS TO NUMBERS (Using FossittCod)
+var habitatDict = ee.Dictionary({
+  'GM1': 1, 'GS2/WS1': 2, 'PB1': 3, 'PF1': 4, 
+  'PF3': 5, 'PF3/GM1': 6, 'PF3/PF1': 7, 'WSI/PB4': 8
+});
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = f.get('FossittCod'); 
+  var num = ee.Number(habitatDict.get(code, -999)); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+//   .filterBounds(habitatPolygons)
+//   .filterDate('2020-01-01', '2020-12-31')
+//   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) // NEW: Cloud filter
+//   .median()
+//   .clip(habitatPolygons);
+
+// var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+// // // //var finalImage = image.addBands(ndvi).select(['B2', 'B3', 'B4', 'B8', 'NDVI']);
+// var finalImage = image.addBands(ndvi).select(['B2', 'B3', 'B4', 'B8'])
+ 
+ 
+ // 1. Create the base  Median Composite
+ var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+   .filterBounds(habitatPolygons)
+   .filterDate('2020-01-01', '2020-12-31')
+   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+   .median()
+   .clip(habitatPolygons);
+
+// // // Define Base Bands for Calculations
+ var nir   = image.select('B8');
+ var red   = image.select('B4');
+ var blue  = image.select('B2');
+ var green = image.select('B3');
+
+// // // 2. CALCULATE 8 SPECTRAL INDICES (Vegetation & Water Health)
+ var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+ var rvi   = nir.divide(red).rename('RVI');
+ var savi  = image.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+ var evi   = image.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+ var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+ var grvi  = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+ var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+ var ndwi  = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+
+
+// // // // 4. COMBINE INTO FINAL TRAINING STACK (15 BANDS TOTAL)
+// var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) // 4 Spectral Bands
+//   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]) // 8 Indices
+   
+   var finalImage = ee.Image([
+  ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi
+]);    
+ 
+
+ print('Final Stack Layers for Classifier:', finalImage.bandNames());
+
+ // =================================================================
+// 4. INCREASE PIXELS (Sampling at m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+// Subtle square smoothing to keep bog edges clean
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+var bogPalette = ['#FFA500', '#008000', '#FFC0CB', '#FF0000', '#800080', '#A52A2A', '#D2B48C', '#FFFF00', '#0000FF'];
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)');
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog Classified Map');
+
+// =================================================================
+// 8. ACCURACY REPORTING
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- ACCURACY REPORT ---');
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Kappa Coefficient:', errorMatrix.kappa());
+print('Producer\'s Accuracy (Precision):', errorMatrix.producersAccuracy());
+print('User\'s Accuracy (Recall):', errorMatrix.consumersAccuracy());
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+// =================================================================
+// 9. DATA INSPECTION (Cloud Check)
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2020-01-01', '2020-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30));
+
+print('Number of images used after cloud filter:', collectionBeforeMedian.size());
+var dates = collectionBeforeMedian.map(function(img) {
+  return ee.Feature(null, {'date': img.date().format('YYYY-MM-dd')});
+}).aggregate_array('date');
+print('Dates of images used:', dates);
+// --- DETAILED ACCURACY REPORT ---
+print('--- VALIDATION METRICS ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy (Validation):', errorMatrix.accuracy());
+print('Kappa Coefficient (Validation):', errorMatrix.kappa());
+ 
