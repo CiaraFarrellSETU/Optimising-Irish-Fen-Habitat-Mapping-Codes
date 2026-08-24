@@ -1,0 +1,134 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Ballymore")
+  .filter(ee.Filter.notNull(['FossittCod']));
+
+// 2. CONVERT STRINGS TO NUMBERS (Using FossittCod)
+var habitatDict = ee.Dictionary({
+  'GM1': 1, 
+  'WS1/GS2': 2, // Fixed order and changed I to 1
+  'PB1': 3, 
+  'PF1': 4, 
+  'PF3': 5, 
+  'PF1/PF3': 6, // Fixed reversed order from shapefile
+  'PF3/GM1': 7, 
+  'WS1/PB4': 8  // Fixed I to 1
+});
+
+// Get the list of habitat text codes dynamically for later use in boxplots
+var habitatNames = habitatDict.keys();
+
+// Define bogPalette to fix "not defined" error
+var bogPalette = [
+  '#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', 
+  '#e6ab02', '#a6761d', '#666666', '#98df8a', '#d62728', 
+  '#ff9896', '#9467bd', '#c5b0d5', '#8c564b', '#c49c94'
+];
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = f.get('FossittCod'); 
+  var num = ee.Number(habitatDict.get(code, -999)); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// =================================================================
+// 3. SELECT IMAGERY + SPECTRAL BANDS (WITH SCALING FIXES)
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2020-01-01', '2020-12-31');
+
+var image = collectionBeforeMedian.median().clip(habitatPolygons);
+
+// Create a cleanly scaled 0-1 reflectance image for explicit expression inputs
+var scaledImage = image.select(['B2', 'B3', 'B4', 'B8']).multiply(0.0001);
+
+// --- SPECTRAL INDICES CALCULATION ---
+
+// 1. NDVI (Normalized Difference Vegetation Index)
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 2. RVI (Ratio Vegetation Index): NIR / Red
+var rvi = image.select('B8').divide(image.select('B4')).rename('RVI');
+
+// 3. GNDVI (Green NDVI): (NIR - Green) / (NIR + Green)
+var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+
+// 4. SAVI (Soil Adjusted Vegetation Index - Fixed Scaling)
+var savi = scaledImage.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4')
+    }).rename('SAVI').clamp(-1.0, 1.0);
+
+// 5. EVI (Enhanced Vegetation Index - Fixed Scaling & Multipliers)
+var evi = scaledImage.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6.0 * RED - 7.5 * BLUE + 1.0))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4'),
+      'BLUE': scaledImage.select('B2')
+    }).rename('EVI').clamp(-1.0, 1.0);
+
+// 6. GRVI (Green-Red Vegetation Index): (Green - Red) / (Green + Red)
+var grvi = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+
+// 7. NRVI (Normalized Ratio Vegetation Index): (RVI - 1) / (RVI + 1)
+var nrvi = image.expression(
+    '(RVI - 1) / (RVI + 1)', {
+      'RVI': rvi
+    }).rename('NRVI');
+
+// 8. NDWI (Normalized Difference Water Index): (Green - NIR) / (Green + NIR)
+var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// --- COMBINE INTO FINAL IMAGE ---
+// Keeping B2 and B8 raw to match your existing logic workflow
+var finalImage = image.addBands([ndvi, rvi, gndvi, savi, evi, grvi, nrvi, ndwi])
+  .select(['B2', 'B3', 'B4', 'B8',
+    'NDVI', 'RVI', 'GNDVI', 'SAVI', 'EVI', 'GRVI', 'NRVI', 'NDWI'
+  ]);
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE CLASSIFIER & GENERATE INSTANT DOWNLOAD LINK
+// =================================================================
+// Classify the validation pixels using your trained model
+ var validated = validationSamples.classify(classifier, 'predicted_habitat');
+
+// // Calculate if the prediction was correct (1 for correct, 0 for incorrect)
+ var rawResults = validated.map(function(feature) {
+   var actual = ee.Number(feature.get('habitat_num'));
+   var predicted = ee.Number(feature.get('predicted_habitat'));
+   var isCorrect = actual.eq(predicted); // 1 if matching, 0 if not
+  
+   return feature.set('is_correct', isCorrect);
+ });
+
+// // Generate an instant direct download link
+ var downloadUrl = rawResults.getDownloadURL({   format: 'csv',
+   selectors: ['habitat_num', 'is_correct'], // Keep only columns needed for the stats
+   filename: 'bally_year'   // Change this for each window run
+ });
+
+// // Print the clickable link into your right console panel
+ print('Click this link to download the CSV directly:', downloadUrl);
