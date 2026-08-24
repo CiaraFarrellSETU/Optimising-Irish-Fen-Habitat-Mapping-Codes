@@ -1,0 +1,339 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Ballymore")
+  .filter(ee.Filter.notNull(['FossittCod']));
+
+// 2. CONVERT STRINGS TO NUMBERS (Using FossittCod)
+var habitatDict = ee.Dictionary({
+  'GM1': 1, 
+  'WS1/GS2': 2, // Fixed order and changed I to 1
+  'PB1': 3, 
+  'PF1': 4, 
+  'PF3': 5, 
+  'PF1/PF3': 6, // Fixed reversed order from shapefile
+  'PF3/GM1': 7, 
+  'WS1/PB4': 8  // Fixed I to 1
+});
+
+// Get the list of habitat text codes dynamically for later use in boxplots
+var habitatNames = habitatDict.keys();
+
+// Define bogPalette to fix "not defined" error
+var bogPalette = [
+  '#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', 
+  '#e6ab02', '#a6761d', '#666666', '#98df8a', '#d62728', 
+  '#ff9896', '#9467bd', '#c5b0d5', '#8c564b', '#c49c94'
+];
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = f.get('FossittCod'); 
+  var num = ee.Number(habitatDict.get(code, -999)); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// =================================================================
+// 3. SELECT IMAGERY & SPECTRAL INDICES CALCULATION (SCALED)
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2020-01-01', '2020-12-31');
+
+var image = collectionBeforeMedian.median().clip(habitatPolygons);
+
+// Scale raw Sentinel-2 bands to true 0-1 range
+var scaledImage = image.multiply(0.0001);
+
+// 1. NDVI (Normalized Difference Vegetation Index)
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 2. RVI (Ratio Vegetation Index)
+var rvi = image.select('B8').divide(image.select('B4')).rename('RVI');
+
+// 3. GNDVI (Green NDVI)
+var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+
+// 4. SAVI (Soil Adjusted Vegetation Index)
+var savi = scaledImage.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4')
+    }).rename('SAVI').clamp(-1.0, 1.0);
+
+// 5. EVI (Enhanced Vegetation Index)
+var evi = scaledImage.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6.0 * RED - 7.5 * BLUE + 1.0))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4'),
+      'BLUE': scaledImage.select('B2')
+    }).rename('EVI').clamp(-1.0, 1.0);
+
+// 6. GRVI (Green-Red Vegetation Index)
+var grvi = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+
+// 7. NRVI (Normalized Ratio Vegetation Index)
+var nrvi = image.expression('(RVI - 1) / (RVI + 1)', {'RVI': rvi}).rename('NRVI');
+
+// 8. NDWI (Normalized Difference Water Index)
+var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// --- COMBINE INTO FINAL IMAGE ---
+var finalImage = image.addBands([ndvi, rvi, gndvi, savi, evi, grvi, nrvi, ndwi])
+  .select(['B2', 'B3', 'B4', 'B8',
+    'NDVI', 'RVI', 'GNDVI', 'SAVI', 'EVI', 'GRVI', 'NRVI', 'NDWI'
+  ]);
+
+print('Final Stack Layers (Phan et al. Method):', finalImage.bandNames());
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+var proj = finalImage.projection();
+
+var smoothed = rawClassified
+  .focalMode(1, 'square', 'pixels')
+  .reproject({crs: proj, scale: 10});
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)');
+Map.addLayer(smoothed, {min: 1, max: 8, palette: bogPalette.slice(0, 8)}, 'Liskeenan Classified Map');
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+// =================================================================
+// 8.5 TRAINING ACCURACY (Internal Check for Overfitting)
+// =================================================================
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+
+// =================================================================
+// 9. DATA INSPECTION
+// =================================================================
+var collectionBeforeMedian2024 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2024-01-01', '2024-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30));
+
+print('Number of images used in inspection stack:', collectionBeforeMedian2024.size());
+
+// =================================================================
+// 10. AREA CALCULATION
+// =================================================================
+var classNames = ee.List([
+  'FL6', 'FS1', 'GS1', 'GS4', 'GS4/GS1', 
+  'HH3', 'PB1', 'PF1', 'PF1/GS4', 'PF3', 
+  'WD3', 'WL2', 'WN6', 'WN7', 'WS1'
+]);
+
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'class',
+  }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var stats = ee.List(areas.get('groups'));
+
+var areaResults = stats.map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  var areaM2 = ee.Number(dict.get('sum'));
+  var areaHa = areaM2.divide(10000);
+  
+  var label = ee.Algorithms.If(
+    classId.gt(0).and(classId.lte(classNames.length())),
+    classNames.get(classId.subtract(1)),
+    'Unknown'
+  );
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Class_ID': classId,
+    'Area_Ha': areaHa
+  });
+});
+
+var areaFC = ee.FeatureCollection(areaResults);
+var totalArea = areaFC.aggregate_sum('Area_Ha');
+
+var finalStats = areaFC.map(function(f) {
+  var pct = ee.Number(f.get('Area_Ha')).divide(totalArea).multiply(100);
+  return f.set('Percentage', pct);
+});
+
+print('--- HABITAT AREA STATS ---', finalStats);
+
+// =================================================================
+// 11. VISUALIZATION CHARTS
+// =================================================================
+var barChart = ui.Chart.feature.byFeature({
+  features: finalStats,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Area_Ha']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Habitat Area Distribution - Hectares',
+  vAxis: {title: 'Area (Ha)'},
+  hAxis: {title: 'Habitat Type'},
+  colors: ['#1d6b99'],
+  legend: {position: 'none'}
+});
+print(barChart);
+
+var pieChart = ui.Chart.feature.byFeature({
+  features: finalStats,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Percentage']
+})
+.setChartType('PieChart')
+.setOptions({
+  title: 'Habitat Composition Percentage',
+  colors: bogPalette
+});
+print(pieChart);
+
+print('--- HABITAT PERCENTAGE BREAKDOWN ---');
+finalStats.evaluate(function(featureCollection) {
+  if (!featureCollection || !featureCollection.features) return;
+  featureCollection.features.forEach(function(feature) {
+    var props = feature.properties;
+    print(props.Habitat_Code + ': ' + props.Percentage.toFixed(2) + '% (' + props.Area_Ha.toFixed(2) + ' Ha)');
+  });
+});
+
+// =================================================================
+// 13. HABITAT SPECTRAL BOX PLOTS (15-CLASS INTERVAL BOXPLOTS)
+// =================================================================
+
+// FIXED: Using FossittCod to match original properties in Section 2
+var boxPlotHabitats = ee.FeatureCollection(
+  habitatNames.map(function(code) {
+    var matchingPolygons = habitatsMapped.filter(ee.Filter.eq('FossittCod', code));
+    return ee.Feature(matchingPolygons.geometry(), {'Habitat': code});
+  })
+);
+
+var boxPlotReducer = ee.Reducer.percentile([0, 25, 50, 75, 100], ['min', 'p25', 'median', 'p75', 'max']);
+
+var generateIntervalBoxPlot = function(bandName, yAxisLabel, chartTitle, colorCode) {
+  var bandImage = finalImage.select(bandName);
+  
+  var statsCollection = boxPlotHabitats.map(function(feature) {
+    var code = feature.get('Habitat');
+    
+    var stats = bandImage.reduceRegion({
+      reducer: boxPlotReducer,
+      geometry: feature.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    });
+    
+    return ee.Feature(null, {
+      'Habitat': code,
+      'median': stats.get(bandName + '_median'),
+      'median_interval_min': stats.get(bandName + '_min'),
+      'median_interval_p25': stats.get(bandName + '_p25'),
+      'median_interval_p75': stats.get(bandName + '_p75'),
+      'median_interval_max': stats.get(bandName + '_max')
+    });
+  }).filter(ee.Filter.notNull(['median']));
+
+  var chart = ui.Chart.feature.byFeature({
+    features: statsCollection,
+    xProperty: 'Habitat',
+    yProperties: ['median']
+  })
+  .setChartType('LineChart')
+  .setOptions({
+    title: chartTitle,
+    vAxis: {title: yAxisLabel},
+    hAxis: {title: 'Habitat Class'},
+    legend: {position: 'none'},
+    lineWidth: 0, 
+    pointsVisible: true,
+    pointSize: 5,
+    colors: [colorCode],
+    intervals: {
+      'style': 'boxes', 
+      'lineWidth': 1, 
+      'barWidth': 0.5, 
+      'fillOpacity': 0.4
+    },
+    interval: {
+      'min': {'style': 'whiskers'},
+      'p25': {'style': 'boxes'},
+      'p75': {'style': 'boxes'},
+      'max': {'style': 'whiskers'}
+    }
+  });
+
+  return chart;
+};
+
+print('--- LISKEENAN SPECTRAL DISTRIBUTIONS (BOX PLOTS) ---');
+print(generateIntervalBoxPlot('EVI', 'Index Value (-1 to 1)', 'EVI Box Plot Distribution per Class', '#1b9e77'));
+print(generateIntervalBoxPlot('B2', 'Reflectance (0 to 10000)', 'B2 Blue Band Box Plot Distribution per Class', '#d95f02'));
+print(generateIntervalBoxPlot('B8', 'Reflectance (0 to 10000)', 'B8 NIR Band Box Plot Distribution per Class', '#7570b3'));
+
+// =================================================================
+// EXTRACTION & DIRECT LOCAL DESKTOP DOWNLOAD LINK
+// =================================================================
+
+var liskeenanSamples = finalImage.select(['EVI', 'B2', 'B8']).sampleRegions({
+  collection: habitatsMapped,
+  properties: ['FossittCod'], // FIXED: Swapped out non-existent HCH_MAPPED field
+  scale: 10,                 
+  tileScale: 4,
+  geometries: false          
+});
+
+var directDownloadUrl = liskeenanSamples.getDownloadURL({
+  format: 'csv',
+  selectors: ['FossittCod', 'EVI', 'B2', 'B8'],
+  filename: 'Ballyn_pixels_for_boxplot_2020'
+});
+
+print('👇 CLICK LINK BELOW TO DOWNLOAD LISKEENAN CSV DIRECTLY 👇');
+print(directDownloadUrl);
