@@ -1,0 +1,580 @@
+// =================================================================
+// 1. IMPORT ASSET & PRE-FILTER
+// =================================================================
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Sbog")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// =================================================================
+// 2. CONVERT STRINGS TO NUMBERS
+// =================================================================
+var habitatNames = ['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'];
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = ee.Dictionary({
+    'FS1': 1, 'FS2': 2, 'FW2/WL2': 3, 'GS4': 4, 
+    'PF1': 5, 'PF3': 6, 'WD4': 7, 'WN6': 8, 'WN7': 9
+  }).get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+
+
+// 3. SELECT IMAGERY + SPECTRAL BANDS
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2020-06-01', '2020-09-30')
+  //.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30));
+
+var image = collectionBeforeMedian.median().clip(habitatPolygons);
+
+// --- SPECTRAL INDICES CALCULATION ---
+
+// 1. NDVI (Normalized Difference Vegetation Index)
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 2. RVI (Ratio Vegetation Index): NIR / Red
+var rvi = image.select('B8').divide(image.select('B4')).rename('RVI');
+
+// 3. GNDVI (Green NDVI): (NIR - Green) / (NIR + Green)
+var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+
+// 4. SAVI (Soil Adjusted Vegetation Index)
+var savi = image.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4')
+    }).rename('SAVI');
+
+// 5. EVI (Enhanced Vegetation Index)
+var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+    }).rename('EVI');
+
+// 6. GRVI (Green-Red Vegetation Index): (Green - Red) / (Green + Red)
+var grvi = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+
+// 7. NRVI (Normalized Ratio Vegetation Index): (RVI - 1) / (RVI + 1)
+var nrvi = image.expression(
+    '(RVI - 1) / (RVI + 1)', {
+      'RVI': rvi
+    }).rename('NRVI');
+
+// 8. NDWI (Normalized Difference Water Index): (Green - NIR) / (Green + NIR)
+var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// --- COMBINE INTO FINAL IMAGE ---
+var finalImage = image.addBands([ndvi, rvi, gndvi, savi, evi, grvi, nrvi, ndwi])
+  .select(['B2', 'B3', 'B4', 'B8',
+    'NDVI', 'RVI', 'GNDVI', 'SAVI', 'EVI', 'GRVI', 'NRVI', 'NDWI'
+  ]);
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+// =================================================================
+// 7. DEFINITIVE HABITAT COLOR PALETTE (9 Unique Classes)
+// =================================================================
+// Standardized colors mapped to your 9 classes:
+// 1: FS1, 2: FS2, 3: FW2/WL2, 4: GS4, 5: PF1, 6: PF3, 7: WD4, 8: WN6, 9: WN7
+var bogPalette = [
+  '#FFA500', // 1: FS1 - Orange
+  '#008000', // 2: FS2 - Green
+  '#FFC0CB', // 3: FW2/WL2 - Pink
+  '#FF0000', // 4: GS4 - Red
+  '#800080', // 5: PF1 - Purple
+  '#A52A2A', // 6: PF3 - Brown
+  '#D2B48C', // 7: WD4 - Tan
+  '#FFFF00', // 8: WN6 - Yellow
+  '#0000FF'  // 9: WN7 - Blue
+];
+
+// Display Raw Background Imagery & Filtered Raster
+Map.centerObject(habitatPolygons, 15);
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)', false); // Set to false so it loads turned off
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog Pixels (Smoothed)', false);
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+// =================================================================
+// 8.5 TRAINING ACCURACY (Internal Check for Overfitting)
+// =================================================================
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+
+// =================================================================
+// 9. DATA INSPECTION
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2024-01-01', '2024-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30));
+
+print('Number of images used:', collectionBeforeMedian.size());
+
+// =================================================================
+// 10. AREA CALCULATION
+// =================================================================
+var classNames = ee.List(['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7']);
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'class',
+  }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var stats = ee.List(areas.get('groups'));
+
+var areaResults = stats.map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  var areaM2 = ee.Number(dict.get('sum'));
+  var areaHa = areaM2.divide(10000);
+  var label = classNames.get(classId.subtract(1));
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Class_ID': classId,
+    'Area_Ha': areaHa
+  });
+});
+
+var areaFC = ee.FeatureCollection(areaResults);
+var totalArea = areaFC.aggregate_sum('Area_Ha');
+
+var finalStats = areaFC.map(function(f) {
+  var pct = ee.Number(f.get('Area_Ha')).divide(totalArea).multiply(100);
+  return f.set('Percentage', pct);
+});
+
+// =================================================================
+// 11. VISUALIZATION CHARTS
+// =================================================================
+print(ui.Chart.feature.byFeature(finalStats, 'Habitat_Code', 'Area_Ha').setChartType('ColumnChart').setOptions({title: 'Area (Ha)'}));
+print(ui.Chart.feature.byFeature(finalStats, 'Habitat_Code', 'Percentage').setChartType('PieChart').setOptions({title: 'Composition %', colors: bogPalette}));
+
+print('--- HABITAT PERCENTAGE BREAKDOWN ---');
+finalStats.evaluate(function(featureCollection) {
+  featureCollection.features.forEach(function(feature) {
+    var props = feature.properties;
+    print(props.Habitat_Code + ': ' + props.Percentage.toFixed(2) + '% (' + props.Area_Ha.toFixed(2) + ' Ha)');
+  });
+});
+
+// =================================================================
+// 12. FEATURE IMPORTANCE PLOT (CORRECTED)
+// =================================================================
+
+// 1. Get variable importance from the trained classifier
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+
+// 2. Extract keys and map over them to create Features
+var importanceFC = ee.FeatureCollection(
+  importance.keys().map(function(key) {
+    return ee.Feature(null, {
+      'Feature': key,
+      'Importance': importance.get(key)
+    });
+  })
+);
+
+// 3. Create and format the chart
+var importanceChart = ui.Chart.feature.byFeature({
+  features: importanceFC.sort('Importance', false), // Sort highest to lowest
+  xProperty: 'Feature',
+  yProperties: ['Importance']
+}).setChartType('ColumnChart')
+  .setOptions({
+    title: 'Random Forest Variable Importance',
+    vAxis: {title: 'Importance Score'},
+    hAxis: {title: 'Spectral Bands & Indices'},
+    legend: {position: 'none'},
+    colors: ['#228B22'] // A nice "Forest" green
+  });
+
+print('--- FEATURE IMPORTANCE ---');
+print(importanceChart);
+
+// =================================================================
+// 8.1 DETAILED ACCURACY METRICS
+// =================================================================
+
+// Extract the numerical values from the error matrix
+var overallAccuracy = errorMatrix.accuracy();
+var kappaValue = errorMatrix.kappa();
+var producersAccuracy = errorMatrix.producersAccuracy(); // Accuracy from perspective of map maker
+var usersAccuracy = errorMatrix.consumersAccuracy();   // Accuracy from perspective of map user
+
+print('--- FINAL VALIDATION SUMMARY ---');
+
+// Print formatted Overall Accuracy
+overallAccuracy.evaluate(function(val) {
+  print('Overall Accuracy: ' + (val * 100).toFixed(2) + '%');
+});
+
+// Print formatted Kappa
+kappaValue.evaluate(function(val) {
+  print('Kappa Coefficient: ' + val.toFixed(4));
+});
+
+// Optional: Print a table of Producer/User accuracy per class
+print('Producers Accuracy (per class):', producersAccuracy);
+print('Users Accuracy (per class):', usersAccuracy);
+
+
+// This calculates the most frequent (mode) class for each polygon
+var polygonMajority = rawClassified.reduceRegions({
+  collection: habitatPolygons,
+  reducer: ee.Reducer.mode(),
+  scale: 10
+});
+
+// Convert the reduced features back into a vector-snapped clean image
+var cleanHabitatMap = polygonMajority
+  .filter(ee.Filter.notNull(['mode']))
+  .reduceToImage(['mode'], ee.Reducer.first())
+  .clip(habitatPolygons);
+
+// --- VISUALIZE ULTRA CLEAN VECTOR MAP ---
+// Setting min: 1 and max: 9 locks each ID perfectly to its assigned palette color index
+Map.addLayer(cleanHabitatMap, {min: 1, max: 9, palette: bogPalette}, 'Polygon Majority (Ultra Clean)');
+
+// Optional: Add a subtle black outline of your original vectors over the map for a crisp finish
+var vectorOutline = ee.Image().paint({
+  featureCollection: habitatPolygons,
+  color: 1,
+  width: 1.5
+});
+Map.addLayer(vectorOutline, {palette: ['#000000']}, 'Original Vector Boundaries');
+
+
+
+//wn7 check 
+// 1. Load your shapefile asset
+var sf = ee.FeatureCollection("projects/ciarafarrell755/assets/Sbog");
+
+// 2. Filter using the correct column name
+var wn7_actual = sf.filter(ee.Filter.eq('HCH_MAPPED', 'WN7'));
+
+// 3. Get the stats
+print('Number of WN7 features found:', wn7_actual.size());
+
+// 4. Calculate total area (using the Actual_Ha property from your chart)
+var stats = wn7_actual.reduceColumns({
+  reducer: ee.Reducer.sum(),
+  selectors: ['Actual_Ha'] 
+});
+
+print('Total Actual Area for WN7 (Hectares):', stats.get('sum'));
+
+// Calculate the area from the geometry itself
+var wn7_with_area = wn7_actual.map(function(feature) {
+  var area = feature.geometry().area().divide(10000); // Convert m² to Hectares
+  return feature.set('Calculated_Ha', area);
+});
+
+print('Calculated Area from Geometry:', wn7_with_area.aggregate_sum('Calculated_Ha'));
+
+
+// =================================================================
+// 13. CALCULATE ACTUAL (ORIGINAL ASSET) AREAS FOR COMPARISON
+// =================================================================
+
+// We calculate area directly from the geometry of the shapefile (habitatsMapped)
+// This avoids errors caused by '0' values in the attribute table or raster scale issues.
+var actualStatsFC = ee.FeatureCollection(habitatNames.map(function(label) {
+  // Filter the original shapefile for this specific habitat code
+  var filtered = habitatsMapped.filter(ee.Filter.eq('HCH_MAPPED', label));
+  
+  // Calculate area in m2 from geometry, then convert to Hectares
+  var areaM2 = filtered.geometry().area();
+  var areaHa = ee.Number(areaM2).divide(10000);
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Actual_Area_Ha': areaHa
+  });
+}));
+
+// Debug check: Print this to the console to verify WN7 is now ~5.4
+print('Verified Vector Areas:', actualStatsFC);
+
+
+// =================================================================
+// 14. ENHANCED COMPARISON GRAPH (Horizontal Diverging)
+// =================================================================
+
+// Prepare the data for the chart by merging Actual and Classified stats
+var comparisonFeatures = finalStats.map(function(f) {
+  var code = f.get('Habitat_Code');
+  
+  // Find the corresponding actual area from our new actualStatsFC
+  var actualMatch = actualStatsFC.filter(ee.Filter.eq('Habitat_Code', code)).first();
+  
+  // Safety check: if no match, set area to 0
+  var actualHa = ee.Algorithms.If(actualMatch, 
+                                 ee.Feature(actualMatch).get('Actual_Area_Ha'), 
+                                 0);
+  
+  return f.set({
+    'Classified_Ha': f.get('Area_Ha'),
+    'Actual_Ha': actualHa
+  });
+}).sort('Actual_Ha', false); // Sort by largest actual habitat for better visualization
+
+// Create the Horizontal Bar Chart
+var betterChart = ui.Chart.feature.byFeature({
+  features: comparisonFeatures,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Actual_Ha', 'Classified_Ha']
+})
+.setChartType('BarChart')
+.setSeriesNames(['Actual (Mapped Geometry)', 'Classified (Model Output)'])
+.setOptions({
+  title: 'Habitat Area Comparison: Mapped vs. Classified',
+  hAxis: {
+    title: 'Total Area (Hectares)',
+    titleTextStyle: {italic: false, bold: true},
+    gridlines: {count: 10}
+  },
+  vAxis: {
+    title: 'Habitat Code',
+    titleTextStyle: {italic: false, bold: true}
+  },
+  chartArea: {width: '60%', height: '80%'},
+  colors: ['#2c3e50', '#27ae60'], // Dark Navy for Reality, Emerald for Model
+  bar: {groupWidth: '80%'},
+  legend: {position: 'top'}
+});
+
+print(betterChart);
+
+// 1. Group and dissolve all polygons by habitat code so each class has exactly ONE geometry
+var habitatCodesUnique = ['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'];
+
+var dissolvedHabitats = ee.FeatureCollection(
+  habitatCodesUnique.map(function(code) {
+    var matchingPolygons = habitatsMapped.filter(ee.Filter.eq('HCH_MAPPED', code));
+    var unionedGeometry = matchingPolygons.geometry(); // Merges all matching polygons together
+    return ee.Feature(unionedGeometry, {'Habitat': code});
+  })
+);
+
+// 2. Define the 5 core percentiles needed for a box plot structure
+var boxPlotReducer = ee.Reducer.percentile([0, 25, 50, 75, 100], ['min', 'p25', 'median', 'p75', 'max']);
+
+// 3. Extract metrics over the dissolved geometries and map into charts
+var generateBoxPlot = function(bandName, yAxisLabel, chartTitle, colorCode) {
+  var bandImage = finalImage.select(bandName);
+  
+  // === FIX HERE: Clamp EVI values so they stay within the standard -1 to 1 range ===
+  if (bandName === 'EVI') {
+    bandImage = bandImage.clamp(-1.0, 1.0);
+  }
+  // =================================================================================
+  
+  var statsCollection = dissolvedHabitats.map(function(feature) {
+    var code = feature.get('Habitat');
+    
+    var stats = bandImage.reduceRegion({
+      reducer: boxPlotReducer,
+      geometry: feature.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    });
+    
+    // Order required by Google Charts: Median, Min, p25, p75, Max
+    return ee.Feature(null, {
+      'Habitat': code,
+      'median': stats.get(bandName + '_median'),
+      'min': stats.get(bandName + '_min'),
+      'p25': stats.get(bandName + '_p25'),
+      'p75': stats.get(bandName + '_p75'),
+      'max': stats.get(bandName + '_max')
+    });
+  }).filter(ee.Filter.notNull(['median']));
+
+  // Create a placeholder UI widget panel that updates once server data arrives
+  var chartPanel = ui.Panel({style: {width: '100%', height: '350px'}});
+  chartPanel.add(ui.Label('Calculating statistics and rendering box plot...'));
+
+  // Use evaluate to safely pull data to the client side and build a proper DataTable
+  statsCollection.evaluate(function(success, failure) {
+    if (failure) {
+      chartPanel.clear();
+      chartPanel.add(ui.Label('Error calculating stats: ' + failure));
+      return;
+    }
+    
+    // Define the strict Google Visualization columns with explicit interval roles
+    var columns = [
+      {id: 'Habitat', label: 'Habitat Class', type: 'string'},
+      {id: 'median', label: 'Median', type: 'number'},
+      {id: 'min', type: 'number', role: 'interval'},
+      {id: 'p25', type: 'number', role: 'interval'},
+      {id: 'p75', type: 'number', role: 'interval'},
+      {id: 'max', type: 'number', role: 'interval'}
+    ];
+    
+    // Map our features directly into rows matching the column structure
+    var rows = success.features.map(function(f) {
+      var p = f.properties;
+      return [p.Habitat, p.median, p.min, p.p25, p.p75, p.max];
+    });
+    
+    // Combine into a valid DataTable dictionary object
+    var dataTable = {cols: columns, rows: rows.map(function(r) { 
+      return {c: r.map(function(v) { return {v: v}; })}; 
+    })};
+    
+    // Build the native UI Chart using the raw data table object
+    var cleanChart = ui.Chart(dataTable, 'LineChart', {
+      title: chartTitle,
+      vAxis: {title: yAxisLabel},
+      hAxis: {title: 'Habitat Class'},
+      legend: {position: 'none'},
+      
+      lineWidth: 0, // No horizontal connecting trend lines!
+      pointsVisible: true,
+      pointSize: 6,
+      colors: [colorCode],
+      
+      // Style the structural intervals natively
+      intervals: { 'style': 'boxes', 'color': colorCode, 'fillOpacity': 0.4 },
+      interval: {
+        'min': { 'style': 'whiskers', 'lineWidth': 1.5 },
+        'max': { 'style': 'whiskers', 'lineWidth': 1.5 },
+        'p25': { 'style': 'boxes' },
+        'p75': { 'style': 'boxes' }
+      }
+    });
+    
+    // Swap the loading label out for our beautiful new chart
+    chartPanel.clear();
+    chartPanel.add(cleanChart);
+  });
+
+  return chartPanel;
+};
+
+// 4. Print the correct aggregated box plots to your console panel
+
+print('--- AGGREGATED HABITAT SPECTRAL BOX PLOTS ---');
+
+print(generateBoxPlot('EVI', 'Index Value (-1 to 1)', 'EVI Distribution per Habitat Class', '#1b9e77'));
+
+print(generateBoxPlot('B2', 'Reflectance (0 to 10000)', 'B2 Blue Band Distribution per Habitat Class', '#d95f02'));
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var classIds = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+// Explicitly pass the expected class order to guarantee alignment
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification', classIds);
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+
+// =================================================================
+// 8.1 DETAILED PER-CLASS METRICS & NICE CONFUSION MATRIX TABLE
+// =================================================================
+print('--- FINAL VALIDATION SUMMARY ---');
+errorMatrix.accuracy().evaluate(function(val) {
+  print('Overall Accuracy: ' + (val * 100).toFixed(2) + '%');
+});
+
+errorMatrix.kappa().evaluate(function(val) {
+  print('Kappa Coefficient: ' + val.toFixed(4));
+});
+
+var cmArray = ee.Array(errorMatrix.array());
+
+print('--- PER-CLASS METRICS BREAKDOWN ---');
+cmArray.evaluate(function(matrix) {
+  habitatNames.forEach(function(name, i) {
+    var rowSum = 0; 
+    var colSum = 0; 
+    var correct = matrix[i][i]; 
+
+    for (var j = 0; j < habitatNames.length; j++) {
+      rowSum += matrix[i][j];
+      colSum += matrix[j][i];
+    }
+
+    var pa = (rowSum > 0) ? ((correct / rowSum) * 100).toFixed(2) : 'N/A';
+    var ua = (colSum > 0) ? ((correct / colSum) * 100).toFixed(2) : 'N/A';
+
+    print(name + ' -> Producer\'s Accuracy: ' + pa + '% | User\'s Accuracy: ' + ua + '%');
+  });
+});
+
+// =================================================================
+// 8.1 FORMATTED CONFUSION MATRIX TABLE DISPLAY
+// =================================================================
+print('--- CONFUSION MATRIX TABLE (Actual Rows vs Predicted Columns) ---');
+
+cmArray.evaluate(function(matrix) {
+  // Print header row with habitat names
+  var header = 'Actual \\ Pred\t' + habitatNames.join('\t');
+  print(header);
+  
+  // Print each row with its corresponding habitat label
+  matrix.forEach(function(row, i) {
+    var rowString = habitatNames[i] + '\t\t' + row.join('\t');
+    print(rowString);
+  });
+});
