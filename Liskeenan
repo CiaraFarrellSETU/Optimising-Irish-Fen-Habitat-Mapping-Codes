@@ -1,0 +1,239 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Liskeenan")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// 2. NEW HABITAT LISTS (15 CLASSES)
+var habitatNames = [
+  'FL6', 'FS1', 'GS1', 'GS4', 'GS4/GS1', 
+  'HH3', 'PB1', 'PF1', 'PF1/GS4', 'PF3', 
+  'WD3', 'WL2', 'WN6', 'WN7', 'WS1'
+];
+
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+// Map your specific colors
+var bogPalette = [
+  '#800080', // FL6 - Purple
+  '#FFA500', // FS1 - Orange
+  '#FF66CC', // GS1 - Rose (Pinkish-red)
+  '#FF0000', // GS4 - Red
+  '#ADD8E6', // GS4/GS1 - Light Blue
+  '#006400', // HH3 - Dark Green
+  '#654321', // PB1 - Dark Brown
+  '#808080', // PF1 - Grey
+  '#CCFF00', // PF1/GS4 - Lime
+  '#8B4513', // PF3 - Brown
+  '#008000', // WD3 - Green
+  '#FFC0CB', // WL2 - Pink
+  '#FFFF00', // WN6 - Yellow
+  '#0000FF', // WN7 - Blue
+  '#FA8072'  // WS1 - Salmon
+];
+
+var habitatLookup = ee.Dictionary.fromLists(habitatNames, habitatIDs);
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = habitatLookup.get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// 3. SELECT IMAGERY
+var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  // .filterDate('2022-01-01', '2024-12-31')
+  .filterDate('2020-01-01', '2020-12-31')
+   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+   .median()
+   .clip(habitatPolygons);
+  
+  // // Define Base Bands for Index Calculations
+ var nir   = image.select('B8');
+ var red   = image.select('B4');
+ var blue  = image.select('B2');
+ var green = image.select('B3');
+
+// // 3. CALCULATE ALL 8 SPECTRAL INDICES
+ var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+ var rvi   = nir.divide(red).rename('RVI');
+ var savi  = image.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+ var evi   = image.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+ var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+ var grvi  = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+ var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+ var ndwi  = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+
+
+// // 5. COMBINE INTO FINAL "SUPER-STACK" (15 BANDS TOTAL)
+// var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) // Raw Spectral
+//   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]) // 8 Indices
+  
+  var finalImage = ee.Image([
+  ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi
+]);           
+
+ print('Final Stack Layers (Phan et al. Method):', finalImage.bandNames());
+
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 10m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// 5. TRAIN ROBUST CLASSIFIER (More trees for complex centers)
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// 6. VALIDATE & SMOOTH
+var validated = validationSamples.classify(classifier);
+var testAccuracy = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- UPDATED RESULTS ---');
+print('Total Pixels Found:', allSamples.size());
+print('Validation Accuracy:', testAccuracy.accuracy());
+
+var rawClassified = finalImage.classify(classifier);
+
+// Subtle square smoothing to keep bog edges clean
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// 7. DISPLAY & EXPORT
+Map.centerObject(habitatPolygons, 15);
+var bogPalette = ['#FFA500', '#008000', '#FFC0CB', '#FF0000', '#800080', '#A52A2A', '#D2B48C', '#FFFF00', '#0000FF'];
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite');
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog High-Res Map');
+
+// 9. ACCURACY REPORT
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Producer\'s Accuracy (Columns):', errorMatrix.producersAccuracy());
+print('User\'s Accuracy (Rows):', errorMatrix.consumersAccuracy());
+
+// 10. MAJORITY FILTER BY POLYGON (Option B)
+// This calculates the most frequent (mode) class for each polygon
+var polygonMajority = rawClassified.reduceRegions({
+  collection: habitatPolygons,
+  reducer: ee.Reducer.mode(),
+  scale: 10
+});
+
+// Convert the reduced features back into an image
+// We use 'mode' because that is the property name created by the reducer
+var cleanHabitatMap = polygonMajority
+  .filter(ee.Filter.notNull(['mode']))
+  .reduceToImage(['mode'], ee.Reducer.first())
+  .clip(habitatPolygons);
+
+// Display the "Solid Block" version
+Map.addLayer(cleanHabitatMap, {min: 1, max: 15, palette: bogPalette}, 'Liskeenan Polygon Majority (Ultra Clean)');
+
+// 3a. INSPECT THE UNDERLYING COLLECTION
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  // .filterDate('2022-01-01', '2024-12-31');
+  .filterDate('2025-06-01', '2025-09-30');
+  
+
+// 1. Get the count of images
+var count = collectionBeforeMedian.size();
+print('Number of individual images in stack:', count);
+
+// 2. Get the dates of all images (formatted for humans)
+var dates = collectionBeforeMedian.map(function(img) {
+  return ee.Feature(null, {'date': img.date().format('YYYY-MM-dd')});
+}).aggregate_array('date');
+
+print('Dates of images used:', dates);
+
+
+// 11. DETAILED CONFUSION MATRIX ANALYSIS
+// This calculates how the 80% validation data performed
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- DETAILED ACCURACY REPORT ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Producer\'s Accuracy (Precision):', errorMatrix.producersAccuracy());
+print('User\'s Accuracy (Recall):', errorMatrix.consumersAccuracy());
+
+// 12. INTERNAL TRAINING ACCURACY (To check for overfitting)
+var trainAccuracy = classifier.confusionMatrix();
+print('Training Accuracy (Internal):', trainAccuracy.accuracy());
+print('Training Confusion Matrix:', trainAccuracy);
+// 13. KAPPA COEFFICIENT
+var kappa = errorMatrix.kappa();
+print('Kappa Coefficient:', kappa);
+
+
+// =================================================================
+// 14. AREA CALCULATION (% AND HECTARES)
+// =================================================================
+
+// Create a list of names to match the IDs for the printout
+var classNames = ee.List(['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7']);
+
+// Use the smoothed classification to calculate area
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'class',
+  }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var stats = ee.List(areas.get('groups'));
+
+// Function to format the results
+var areaResults = stats.map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  var areaM2 = ee.Number(dict.get('sum'));
+  var areaHa = areaM2.divide(10000); // Convert to hectares
+  
+  // Get label from our name list (adjusting for 0-based index)
+  var label = classNames.get(classId.subtract(1));
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Class_ID': classId,
+    'Area_Ha': areaHa,
+    'Area_M2': areaM2
+  });
+});
+
+var areaFC = ee.FeatureCollection(areaResults);
+
+// Calculate total area to get percentages
+var totalArea = areaFC.aggregate_sum('Area_Ha');
+
+var finalStats = areaFC.map(function(f) {
+  var pct = ee.Number(f.get('Area_Ha')).divide(totalArea).multiply(100);
+  return f.set('Percentage', pct);
+});
+
+print('--- HABITAT AREA STATS ---', finalStats);
+
+
+
+
+
