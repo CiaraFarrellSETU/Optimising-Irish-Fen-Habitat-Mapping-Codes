@@ -1,0 +1,174 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Liskeenan")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// 2. NEW HABITAT LISTS (15 CLASSES)
+var habitatNames = [
+  'FL6', 'FS1', 'GS1', 'GS4', 'GS4/GS1', 
+  'HH3', 'PB1', 'PF1', 'PF1/GS4', 'PF3', 
+  'WD3', 'WL2', 'WN6', 'WN7', 'WS1'
+];
+
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+// Map your specific colors
+var bogPalette = [
+  '#800080', // FL6 - Purple
+  '#FFA500', // FS1 - Orange
+  '#FF66CC', // GS1 - Rose (Pinkish-red)
+  '#FF0000', // GS4 - Red
+  '#ADD8E6', // GS4/GS1 - Light Blue
+  '#006400', // HH3 - Dark Green
+  '#654321', // PB1 - Dark Brown
+  '#808080', // PF1 - Grey
+  '#CCFF00', // PF1/GS4 - Lime
+  '#8B4513', // PF3 - Brown
+  '#008000', // WD3 - Green
+  '#FFC0CB', // WL2 - Pink
+  '#FFFF00', // WN6 - Yellow
+  '#0000FF', // WN7 - Blue
+  '#FA8072'  // WS1 - Salmon
+];
+
+var habitatLookup = ee.Dictionary.fromLists(habitatNames, habitatIDs);
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = habitatLookup.get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// =================================================================
+// 3. SELECT THE SINGLE BEST SCENE (2019-2021)
+// =================================================================
+
+// // // 1. Get the collection for the full 6-year range
+// var bestSceneCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+//   .filterBounds(habitatPolygons)
+//   .filterDate('2019-01-01', '2021-12-31')
+//       // We sort by cloud cover (lowest first)
+//   .sort('CLOUDY_PIXEL_PERCENTAGE');
+
+// // // 2. Pick the very first (clearest) image
+// var image = ee.Image(bestSceneCollection.first())
+//   .clip(habitatPolygons);
+
+// // // // 3. Extract metadata to see which date won
+// var sceneDate = image.date().format('YYYY-MM-dd');
+// var sceneCloud = image.get('CLOUDY_PIXEL_PERCENTAGE');
+
+// print('--- BEST SCENE FOUND ---');
+// print('Date of selected image:', sceneDate);
+// print('Cloud Cover % of this scene:', sceneCloud);
+
+// // // // Proceed with NDVI and Band selection
+// var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+// var finalImage = image.addBands(ndvi).select(['B2', 'B3', 'B4', 'B8']);
+
+// =================================================================
+// 3. BEST SCENE (2019-2025) + 8 INDICES + AUXILIARY
+// =================================================================
+
+
+// // 1. Get the collection for the full 6-year range
+ var bestSceneCollection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+   .filterBounds(habitatPolygons)
+   .filterDate('2019-01-01', '2020-12-31')
+       // We sort by cloud cover (lowest first)
+   .sort('CLOUDY_PIXEL_PERCENTAGE');
+ var rawImage = ee.Image(bestSceneCollection.first()).clip(habitatPolygons);
+
+// // Metadata for tracking
+ print('Date of Best Scene:', rawImage.date().format('YYYY-MM-dd'));
+
+
+
+// // // 2. Define Base Bands for Indices
+ var nir   = rawImage.select('B8');
+ var red   = rawImage.select('B4');
+ var blue  = rawImage.select('B2');
+ var green = rawImage.select('B3');
+
+// // // 3. CALCULATE ALL 8 SPECTRAL INDICES
+ var ndvi  = rawImage.normalizedDifference(['B8', 'B4']).rename('NDVI');
+ var rvi   = nir.divide(red).rename('RVI');
+ var savi  = rawImage.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+ var evi   = rawImage.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+ var gndvi = rawImage.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+ var grvi  = rawImage.normalizedDifference(['B3', 'B4']).rename('GRVI');
+ var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+ var ndwi  = rawImage.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+
+// // // 5. COMBINE INTO FINAL TRAINING STACK (15 BANDS TOTAL)
+ var finalImage = rawImage.select(['B2', 'B3', 'B4', 'B8']) // 4 Spectral Bands
+   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]) // 8 Indices
+
+
+// print('Final Stack Layers for Classifier:', finalImage.bandNames());
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+var bogPalette = ['#FFA500', '#008000', '#FFC0CB', '#FF0000', '#800080', '#A52A2A', '#D2B48C', '#FFFF00', '#0000FF'];
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)');
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog Classified Map');
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+// =================================================================
+// 8.5 TRAINING ACCURACY (Internal Check for Overfitting)
+// =================================================================
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+
+
+// --- DETAILED ACCURACY REPORT ---
+print('--- VALIDATION METRICS ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy (Validation):', errorMatrix.accuracy());
+print('Kappa Coefficient (Validation):', errorMatrix.kappa());
