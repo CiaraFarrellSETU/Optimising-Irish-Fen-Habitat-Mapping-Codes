@@ -1,0 +1,311 @@
+// 1. IMPORT ASSET & PRE-FILTER
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Liskeenan")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// 2. NEW HABITAT LISTS (15 CLASSES)
+var habitatNames = [
+  'FL6', 'FS1', 'GS1', 'GS4', 'GS4/GS1', 
+  'HH3', 'PB1', 'PF1', 'PF1/GS4', 'PF3', 
+  'WD3', 'WL2', 'WN6', 'WN7', 'WS1'
+];
+
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+var bogPalette = [
+  '#e41a1c', // 1. Vivid Red
+  '#377eb8', // 2. Deep Blue
+  '#4daf4a', // 3. Grass Green
+  '#984ea3', // 4. Purple
+  '#ff7f00', // 5. Vivid Orange
+  '#a65628', // 6. Deep Brown
+  '#f781bf', // 7. Bright Pink
+  '#999999', // 8. Neutral Grey
+  '#66c2a5', // 9. Mint / Teal
+  '#fc8d62', // 10. Coral
+  '#8da0cb', // 11. Periwinkle Blue
+  '#e78ac3', // 12. Magenta
+  '#a6d854', // 13. Lime Green
+  '#ffd92f', // 14. Bright Yellow
+  '#b3de69'  // 15. Pale Olive Green
+];
+
+var habitatLookup = ee.Dictionary.fromLists(habitatNames, habitatIDs);
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = habitatLookup.get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// 3. SELECT IMAGERY + MOISTURE BANDS
+// =================================================================
+// 3. SELECT IMAGERY: 2025 GROWING SEASON MEDIAN
+// =================================================================
+ var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+   .filterBounds(habitatPolygons)
+   .filterDate('2020-06-01', '2020-09-30') // Summer 2020
+   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) // Only relatively clear days
+   .median() // The "Magic" step: creates one clean image from many
+   .clip(habitatPolygons);
+
+// // Proceed with NDVI and Band selection
+// var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+// //var finalImage = image.addBands(ndvi).select(['B2', 'B3', 'B4', 'B8', 'NDVI']);
+// var finalImage = image.addBands(ndvi).select(['B2', 'B3', 'B4', 'B8']);
+
+
+
+// // Define Base Bands for Index Calculations
+ var nir   = image.select('B8');
+ var red   = image.select('B4');
+ var blue  = image.select('B2');
+ var green = image.select('B3');
+
+// // 3. CALCULATE ALL 8 SPECTRAL INDICES
+ var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+ var rvi   = nir.divide(red).rename('RVI');
+ var savi  = image.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+ var evi   = image.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+ var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+ var grvi  = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+ var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+ var ndwi  = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+
+// // 5. COMBINE INTO FINAL "SUPER-STACK" (15 BANDS TOTAL)
+ var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) // Raw Spectral
+   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]) // 8 Indic   
+  
+       
+
+ print('Final Stack Layers (Phan et al. Method):', finalImage.bandNames());
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.2));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.2));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+// =================================================================
+// 7. DISPLAY LAYERS (UPDATED FOR 15 CLASSES)
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+
+// Expanded 15-color palette to match your Fossitt codes
+var bogPalette = [
+  '#e41a1c', // 1. Vivid Red
+  '#377eb8', // 2. Deep Blue
+  '#4daf4a', // 3. Grass Green
+  '#984ea3', // 4. Purple
+  '#ff7f00', // 5. Vivid Orange
+  '#a65628', // 6. Deep Brown
+  '#f781bf', // 7. Bright Pink
+  '#999999', // 8. Neutral Grey
+  '#66c2a5', // 9. Mint / Teal
+  '#fc8d62', // 10. Coral
+  '#8da0cb', // 11. Periwinkle Blue
+  '#e78ac3', // 12. Magenta
+  '#a6d854', // 13. Lime Green
+  '#ffd92f', // 14. Bright Yellow
+  '#b3de69'  // 15. Pale Olive Green
+];
+
+// 1. True Color Layer (using the raw 'image' variable)
+Map.addLayer(image, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)');
+
+// 2. Classified Layer (using 15 classes)
+Map.addLayer(smoothed, {
+  min: 1, 
+  max: 15, 
+  palette: bogPalette
+}, 'Scragh Bog Classified Map');
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+// =================================================================
+// 8.5 TRAINING ACCURACY (Internal Check for Overfitting)
+// =================================================================
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+
+// =================================================================
+// 8. ACCURACY REPORTING
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+print('Confusion Matrix (Validation):', errorMatrix);
+
+print('--- TRAINING ACCURACY (Internal) ---');
+var trainAccuracyMatrix = classifier.confusionMatrix(); 
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+
+
+// =================================================================
+// 13. CALCULATE ACTUAL & CLASSIFIED AREAS (STRICT PROJECTION)
+// =================================================================
+
+// 1. Calculate Vector Actual Areas (from your shapefile)
+var actualStatsFC = ee.FeatureCollection(habitatNames.map(function(label) {
+  var filtered = habitatsMapped.filter(ee.Filter.eq('HCH_MAPPED', label));
+  var areaM2 = filtered.geometry().area();
+  var areaHa = ee.Number(areaM2).divide(10000);
+  
+  return ee.Feature(null, {
+    'Habitat_Code': label,
+    'Actual_Area_Ha': areaHa
+  });
+}));
+
+// 2. Calculate Classified Raster Areas 
+// We use a specific projection (EPSG:3857) to ensure meters are calculated correctly
+var areaImage = ee.Image.pixelArea().divide(10000); 
+var classifiedWithArea = areaImage.addBands(smoothed);
+
+var classifiedAreaStats = classifiedWithArea.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'habitat_num',
+  }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10, // Matches Sentinel-2 resolution
+  maxPixels: 1e8,
+  tileScale: 4 // Helps with memory for complex bogs
+});
+
+var classifiedCounts = ee.List(classifiedAreaStats.get('groups'));
+
+// Convert the list of results into a lookup dictionary for Section 14
+var classDict = ee.Dictionary(classifiedCounts.map(function(item) {
+  var d = ee.Dictionary(item);
+  return [ee.String(d.get('habitat_num')), d.get('sum')];
+}).flatten());
+
+// =================================================================
+// 14. ENHANCED COMPARISON GRAPH (FINAL VERSION)
+// =================================================================
+
+var comparisonFeatures = actualStatsFC.map(function(f) {
+  var label = ee.String(f.get('Habitat_Code'));
+  
+  // 1. Get the numerical ID for the current label
+  var idIdx = ee.List(habitatNames).indexOf(label);
+  var idNum = ee.Number(ee.List(habitatIDs).get(idIdx)).toInt();
+  
+  // 2. Convert ID to String (GEE Dictionaries require String keys)
+  var idKey = idNum.format();
+  
+  // 3. Lookup the classified area, defaulting to 0 if the class wasn't predicted
+  var classHa = ee.Number(
+    ee.Algorithms.If(classDict.contains(idKey), classDict.get(idKey), 0)
+  );
+  
+  return f.set({
+    'Actual_Ha': f.get('Actual_Area_Ha'),
+    'Classified_Ha': classHa
+  });
+}).sort('Actual_Ha', false); 
+
+// Plotting the final Chart
+var comparisonChart = ui.Chart.feature.byFeature({
+  features: comparisonFeatures,
+  xProperty: 'Habitat_Code',
+  yProperties: ['Actual_Ha', 'Classified_Ha']
+})
+.setChartType('BarChart')
+.setSeriesNames(['Original Survey (Actual)', 'RF Classification (Model)'])
+.setOptions({
+  title: 'Habitat Area Comparison: Mapped vs. Classified ',
+  hAxis: {
+    title: 'Total Area (Hectares)',
+    titleTextStyle: {italic: false, bold: true},
+    gridlines: {count: 10}
+  },
+  vAxis: {
+    title: 'Fossitt Habitat Code',
+    titleTextStyle: {italic: false, bold: true}
+  },
+  chartArea: {width: '60%', height: '80%'},
+  colors: ['#2c3e50', '#27ae60'], // Dark Slate vs Emerald Green
+  bar: {groupWidth: '80%'},
+  legend: {position: 'top'}
+});
+
+print(comparisonChart);
+
+// =================================================================
+// 15. FEATURE IMPORTANCE PLOT
+// =================================================================
+
+// Extract importance scores from the trained classifier
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+
+// Convert to a FeatureCollection for plotting
+var importanceFC = ee.FeatureCollection(
+  importance.keys().map(function(key) {
+    return ee.Feature(null, {
+      'index': key,
+      'importance': importance.get(key)
+    });
+  })
+).sort('importance', false); // Sort so the most important index is at the top
+
+// Create the Chart
+var importanceChart = ui.Chart.feature.byFeature({
+  features: importanceFC,
+  xProperty: 'index',
+  yProperties: ['importance']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Random Forest Feature Importance (Spectral Indices)',
+  vAxis: {title: 'Importance Score'},
+  hAxis: {title: 'Spectral Index'},
+  legend: {position: 'none'},
+  colors: ['#e67e22'] // Orange color to stand out
+});
+
+print('--- MODEL INSIGHTS ---');
+print(importanceChart);
