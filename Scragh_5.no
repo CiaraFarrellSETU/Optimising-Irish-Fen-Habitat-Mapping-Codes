@@ -1,0 +1,198 @@
+// =================================================================
+// 1. IMPORT ASSET & PRE-FILTER
+// =================================================================
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Sbog")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+// =================================================================
+// 2. CONVERT STRINGS TO NUMBERS
+// =================================================================
+var habitatNames = ['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'];
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = ee.Dictionary({
+    'FS1': 1, 'FS2': 2, 'FW2/WL2': 3, 'GS4': 4, 
+    'PF1': 5, 'PF3': 6, 'WD4': 7, 'WN6': 8, 'WN7': 9
+  }).get(code, 0); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// =================================================================
+// 3. SELECT IMAGERY + SPECTRAL BANDS (WITH SCALING FIXES)
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2020-01-01', '2020-12-31');
+
+var image = collectionBeforeMedian.median().clip(habitatPolygons);
+
+// Create a cleanly scaled 0-1 reflectance image for explicit expression inputs
+var scaledImage = image.select(['B2', 'B3', 'B4', 'B8']).multiply(0.0001);
+
+// --- SPECTRAL INDICES CALCULATION ---
+
+// 1. NDVI (Normalized Difference Vegetation Index)
+var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// 2. RVI (Ratio Vegetation Index): NIR / Red
+var rvi = image.select('B8').divide(image.select('B4')).rename('RVI');
+
+// 3. GNDVI (Green NDVI): (NIR - Green) / (NIR + Green)
+var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+
+// 4. SAVI (Soil Adjusted Vegetation Index - Fixed Scaling)
+var savi = scaledImage.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4')
+    }).rename('SAVI').clamp(-1.0, 1.0);
+
+// 5. EVI (Enhanced Vegetation Index - Fixed Scaling & Multipliers)
+var evi = scaledImage.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6.0 * RED - 7.5 * BLUE + 1.0))', {
+      'NIR': scaledImage.select('B8'),
+      'RED': scaledImage.select('B4'),
+      'BLUE': scaledImage.select('B2')
+    }).rename('EVI').clamp(-1.0, 1.0);
+
+// 6. GRVI (Green-Red Vegetation Index): (Green - Red) / (Green + Red)
+var grvi = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+
+// 7. NRVI (Normalized Ratio Vegetation Index): (RVI - 1) / (RVI + 1)
+var nrvi = image.expression(
+    '(RVI - 1) / (RVI + 1)', {
+      'RVI': rvi
+    }).rename('NRVI');
+
+// 8. NDWI (Normalized Difference Water Index): (Green - NIR) / (Green + NIR)
+var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// --- COMBINE INTO FINAL IMAGE ---
+// Keeping B2 and B8 raw to match your existing logic workflow
+var finalImage = image.addBands([ndvi, rvi, gndvi, savi, evi, grvi, nrvi, ndwi])
+  .select(['B2', 'B3', 'B4', 'B8',
+    'NDVI', 'RVI', 'GNDVI', 'SAVI', 'EVI', 'GRVI', 'NRVI', 'NDWI'
+  ]);
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+}).randomColumn('random');
+
+var trainingSamples = allSamples.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = allSamples.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS & PALETTE
+// =================================================================
+var bogPalette = [
+  '#FFA500', // 1: FS1 - Orange
+  '#008000', // 2: FS2 - Green
+  '#FFC0CB', // 3: FW2/WL2 - Pink
+  '#FF0000', // 4: GS4 - Red
+  '#800080', // 5: PF1 - Purple
+  '#A52A2A', // 6: PF3 - Brown
+  '#D2B48C', // 7: WD4 - Tan
+  '#FFFF00', // 8: WN6 - Yellow
+  '#0000FF'  // 9: WN7 - Blue
+];
+
+Map.centerObject(habitatPolygons, 15);
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)', false);
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog Pixels (Smoothed)', false);
+
+// =================================================================
+// 8. ACCURACY REPORTING
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+var trainAccuracyMatrix = classifier.confusionMatrix();
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+
+// =================================================================
+// 9. AREA CALCULATION & PLOTS
+// =================================================================
+var classNames = ee.List(['FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7']);
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'class' }),
+  geometry: habitatPolygons.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var stats = ee.List(areas.get('groups'));
+var areaResults = stats.map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  var areaM2 = ee.Number(dict.get('sum'));
+  return ee.Feature(null, {
+    'Habitat_Code': classNames.get(classId.subtract(1)),
+    'Class_ID': classId,
+    'Area_Ha': areaM2.divide(10000)
+  });
+});
+
+var finalStats = ee.FeatureCollection(areaResults);
+print(ui.Chart.feature.byFeature(finalStats, 'Habitat_Code', 'Area_Ha').setChartType('ColumnChart'));
+
+// =================================================================
+// 10. VARIABLE IMPORTANCE PLOT
+// =================================================================
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+var importanceFC = ee.FeatureCollection(importance.keys().map(function(k) {
+  return ee.Feature(null, {'Feature': k, 'Importance': importance.get(k)});
+}));
+print(ui.Chart.feature.byFeature({features: importanceFC.sort('Importance', false), xProperty: 'Feature', yProperties: ['Importance']}).setChartType('ColumnChart'));
+
+// =================================================================
+// 11. EXTRACTION & DIRECT LOCAL DESKTOP DOWNLOAD LINK
+// =================================================================
+var directSamples = finalImage.select(['EVI', 'B2', 'B8']).sampleRegions({
+  collection: habitatsMapped,
+  properties: ['HCH_MAPPED'],
+  scale: 10,                 
+  tileScale: 4,
+  geometries: false          
+});
+
+var downloadUrl = directSamples.getDownloadURL({
+  format: 'csv',
+  selectors: ['HCH_MAPPED', 'EVI', 'B2', 'B8'],
+  filename: 'habitat_pixels_for_boxplot_2020'
+});
+
+print('👇 CLICK LINK BELOW TO DOWNLOAD CSV DIRECTLY TO COMPUTER 👇');
+print(downloadUrl);
