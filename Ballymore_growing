@@ -1,0 +1,226 @@
+// 1. IMPORT ASSET
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Ballymore");
+
+// 2. CONVERT STRINGS TO NUMBERS (Using FossittCod)
+var habitatDict = ee.Dictionary({
+  'GM1': 1, 'WS1/GS2': 2, 'PB1': 3, 'PF1': 4, 
+  'PF3': 5, 'PF3/GM1': 6, 'PF1/PF3': 7, 'WS1/PB4': 8
+});
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = f.get('FossittCod'); 
+  var num = ee.Number(habitatDict.get(code, -999)); 
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// 3. SELECT IMAGERY + MOISTURE BANDS
+// =================================================================
+// 3. SELECT IMAGERY:  GROWING SEASON MEDIAN
+// =================================================================
+ var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+   .filterBounds(habitatPolygons)
+   .filterDate('2020-06-01', '2020-09-30') // Summer 2020
+   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) // Only relatively clear days
+   .median() // The "Magic" step: creates one clean image from many
+   .clip(habitatPolygons);
+
+
+
+// // // Define Base Bands for Index Calculations
+ var nir   = image.select('B8');
+ var red   = image.select('B4');
+ var blue  = image.select('B2');
+ var green = image.select('B3');
+
+// // // 3. CALCULATE ALL 8 SPECTRAL INDICES
+ var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+ var rvi   = nir.divide(red).rename('RVI');
+ var savi  = image.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+ var evi   = image.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+ var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+ var grvi  = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+ var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+ var ndwi  = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+
+
+// // // 5. COMBINE INTO FINAL "SUPER-STACK" (15 BANDS TOTAL)
+ var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) // Raw Spectral
+   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]) // 8 Indices
+ 
+
+
+ print('Final Stack Layers (Phan et al. Method):', finalImage.bandNames());
+
+
+// =================================================================
+// 4. INCREASE PIXELS (Sampling at 5m scale)
+// =================================================================
+// =================================================================
+// 4. STRATIFIED SAMPLING (Guarantees samples for every class)
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5, 
+  tileScale: 4
+});
+
+// Stratified split: takes 80% training and 20% validation per individual habitat class
+var split = allSamples.randomColumn('random');
+var trainingSamples = split.filter(ee.Filter.lt('random', 0.8));
+var validationSamples = split.filter(ee.Filter.gte('random', 0.8));
+
+// =================================================================
+// 5. TRAIN ROBUST CLASSIFIER
+// =================================================================
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+// =================================================================
+// 6. VALIDATE & SMOOTH
+// =================================================================
+var rawClassified = finalImage.classify(classifier);
+
+var smoothed = rawClassified
+  .reproject({crs: 'EPSG:4326', scale: 10})
+  .focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 7. DISPLAY LAYERS
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+var bogPalette = ['#FFA500', '#008000', '#FFC0CB', '#FF0000', '#800080', '#A52A2A', '#D2B48C', '#FFFF00', '#0000FF'];
+
+Map.addLayer(finalImage, {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000}, 'Satellite (True Color)');
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Scragh Bog Classified Map');
+
+// =================================================================
+// 8. ACCURACY REPORTING (Validation Data - Unseen)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification');
+
+print('--- VALIDATION ACCURACY (Test Data) ---');
+print('Validation Accuracy:', errorMatrix.accuracy());
+print('Validation Kappa:', errorMatrix.kappa());
+
+// =================================================================
+// 8.5 TRAINING ACCURACY (Internal Check for Overfitting)
+// =================================================================
+var trainAccuracyMatrix = classifier.confusionMatrix();
+
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Confusion Matrix:', trainAccuracyMatrix);
+
+// =================================================================
+// 9. DATA INSPECTION
+// =================================================================
+var collectionBeforeMedian = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(habitatPolygons)
+  .filterDate('2024-01-01', '2024-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30));
+
+print('Number of images used:', collectionBeforeMedian.size());
+
+
+
+
+// --- DETAILED ACCURACY REPORT ---
+print('--- VALIDATION METRICS ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy (Validation):', errorMatrix.accuracy());
+print('Kappa Coefficient (Validation):', errorMatrix.kappa());
+
+// To get Training Accuracy, you must calculate the matrix for the training data
+// Assuming 'trainedClassifier' is your model and 'trainingSet' is your training data
+
+print('--- VALIDATION METRICS ---');
+print('Confusion Matrix (Validation):', errorMatrix);
+print('Overall Accuracy (Validation):', errorMatrix.accuracy());
+print('Kappa Coefficient (Validation):', errorMatrix.kappa());
+
+
+// =================================================================
+// 8.1 DETAILED PER-CLASS ACCURACY & NICE CONFUSION MATRIX
+// =================================================================
+var habitatNames = ['GM1', 'GS2/WS1', 'PB1', 'PF1', 'PF3', 'PF3/GM1', 'PF3/PF1', 'WSI/PB4'];
+var classIds = [1, 2, 3, 4, 5, 6, 7, 8];
+
+// Explicitly pass class IDs to the error matrix to lock the 8x8 orientation
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification', classIds);
+
+print('--- FINAL VALIDATION SUMMARY ---');
+errorMatrix.accuracy().evaluate(function(val) {
+  print('Overall Accuracy: ' + (val * 100).toFixed(2) + '%');
+});
+
+errorMatrix.kappa().evaluate(function(val) {
+  print('Kappa Coefficient: ' + val.toFixed(4));
+});
+
+var cmArray = ee.Array(errorMatrix.array());
+
+print('--- PER-CLASS METRICS BREAKDOWN ---');
+cmArray.evaluate(function(matrix) {
+  habitatNames.forEach(function(name, i) {
+    var rowSum = 0; 
+    var colSum = 0; 
+    var correct = matrix[i][i]; 
+
+    for (var j = 0; j < habitatNames.length; j++) {
+      rowSum += matrix[i][j];
+      colSum += matrix[j][i];
+    }
+
+    var pa = (rowSum > 0) ? ((correct / rowSum) * 100).toFixed(2) : 'N/A';
+    var ua = (colSum > 0) ? ((correct / colSum) * 100).toFixed(2) : 'N/A';
+
+    print(name + ' -> Producer\'s Accuracy: ' + pa + '% | User\'s Accuracy: ' + ua + '%');
+  });
+});
+
+// Nice Labeled Confusion Matrix Table Output in Console
+var matrixTable = ee.FeatureCollection(ee.List.sequence(0, habitatNames.length - 1).map(function(index) {
+  index = ee.Number(index);
+  var row = ee.List(cmArray.toList().get(index));
+  var rowName = ee.String(ee.List(habitatNames).get(index));
+  
+  var rowDict = ee.Dictionary.fromLists(habitatNames, row);
+  return ee.Feature(null, rowDict).set('Actual_Class', rowName);
+}));
+
+print('--- NICE CONFUSION MATRIX TABLE ---', matrixTable);
+
+
+// =================================================================
+// 8.1 FORMATTED CONFUSION MATRIX TABLE DISPLAY
+// =================================================================
+print('--- CONFUSION MATRIX TABLE (Actual Rows vs Predicted Columns) ---');
+
+cmArray.evaluate(function(matrix) {
+  // Print header row with habitat names
+  var header = 'Actual \\ Pred\t' + habitatNames.join('\t');
+  print(header);
+  
+  // Print each row with its corresponding habitat label
+  matrix.forEach(function(row, i) {
+    var rowString = habitatNames[i] + '\t\t' + row.join('\t');
+    print(rowString);
+  });
+});
+
+
+// =================================================================
+// CHECK UNIQUE HASH/STRING VALUES IN ASSET
+// =================================================================
+// =================================================================
+// CHECK UNIQUE STRING VALUES IN ASSET
+// =================================================================
+var uniqueHabitatCodes = habitatPolygons.aggregate_array('FossittCod').distinct();
+print('Unique habitat codes found in asset:', uniqueHabitatCodes);
