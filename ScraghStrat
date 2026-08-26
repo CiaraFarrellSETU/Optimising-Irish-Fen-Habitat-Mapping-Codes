@@ -1,0 +1,197 @@
+// =================================================================
+// 1. SETUP & CONFIGURATION (9 Classes - Sbog Asset)
+// =================================================================
+var habitatPolygons = ee.FeatureCollection("projects/ciarafarrell755/assets/Sbog")
+  .filter(ee.Filter.notNull(['HCH_MAPPED']));
+
+var classNames = ee.List([
+  'FS1', 'FS2', 'FW2/WL2', 'GS4', 'PF1', 'PF3', 'WD4', 'WN6', 'WN7'
+]);
+
+var habitatIDs = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+var bogPalette = [
+  '#FFA500', // FS1 - Orange
+  '#32CD32', // FS2 - Lime Green
+  '#008080', // FW2/WL2 - Teal
+  '#FF0000', // GS4 - Red
+  '#808080', // PF1 - Grey
+  '#8B4513', // PF3 - Brown
+  '#006400', // WD4 - Dark Green
+  '#FFFF00', // WN6 - Yellow
+  '#0000FF'  // WN7 - Blue
+];
+
+var habitatLookup = ee.Dictionary.fromLists(classNames, habitatIDs);
+
+var habitatsMapped = habitatPolygons.map(function(f) {
+  var code = ee.String(f.get('HCH_MAPPED'));
+  var num = ee.Number(habitatLookup.get(code, 0));  
+  return f.set('habitat_num', num);
+}).filter(ee.Filter.gt('habitat_num', 0));
+
+// =================================================================
+// 2. IMAGE PROCESSING & FEATURE ENGINEERING
+// =================================================================
+var image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+   .filterBounds(habitatPolygons)
+   .filterDate('2020-06-01', '2020-09-30') // Summer 2020
+   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+   .median()
+   .clip(habitatPolygons);
+
+// Define Base Bands for Index Calculations
+var nir   = image.select('B8');
+var red   = image.select('B4');
+var blue  = image.select('B2');
+var green = image.select('B3');
+
+// Calculate 8 Spectral Indices
+var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var rvi   = nir.divide(red).rename('RVI');
+var savi  = image.expression('((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {'NIR': nir, 'RED': red}).rename('SAVI');
+var evi   = image.expression('2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {'NIR': nir, 'RED': red, 'BLUE': blue}).rename('EVI');
+var gndvi = image.normalizedDifference(['B8', 'B3']).rename('GNDVI');
+var grvi  = image.normalizedDifference(['B3', 'B4']).rename('GRVI');
+var nrvi  = (rvi.subtract(1)).divide(rvi.add(1)).rename('NRVI');
+var ndwi  = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+
+// Combine into Final Super-Stack
+var finalImage = image.select(['B2', 'B3', 'B4', 'B8']) // Raw Spectral
+   .addBands([ndvi, rvi, savi, evi, gndvi, grvi, nrvi, ndwi]); // 8 Indices
+
+print('Final Stack Layers:', finalImage.bandNames());
+
+// =================================================================
+// 3. STRATIFIED RANDOM SAMPLING & CLASSIFICATION
+// =================================================================
+var allSamples = finalImage.sampleRegions({
+  collection: habitatsMapped,
+  properties: ['habitat_num'],
+  scale: 5,  
+  tileScale: 4
+});
+
+var trainingSamples = ee.FeatureCollection([]);
+var validationSamples = ee.FeatureCollection([]);
+
+habitatIDs.forEach(function(id) {
+  var classSamples = allSamples.filter(ee.Filter.eq('habitat_num', id)).randomColumn('random');
+  var classTrain = classSamples.filter(ee.Filter.lt('random', 0.8));
+  var classVal = classSamples.filter(ee.Filter.gte('random', 0.8));
+  
+  trainingSamples = trainingSamples.merge(classTrain);
+  validationSamples = validationSamples.merge(classVal);
+});
+
+var classifier = ee.Classifier.smileRandomForest(250).train({
+  features: trainingSamples,
+  classProperty: 'habitat_num',
+  inputProperties: finalImage.bandNames()
+});
+
+var rawClassified = finalImage.classify(classifier);
+var smoothed = rawClassified.reproject({crs: 'EPSG:4326', scale: 10}).focalMode(1, 'square', 'pixels');
+
+// =================================================================
+// 4. AREA CALCULATIONS
+// =================================================================
+var areaImage = ee.Image.pixelArea().addBands(smoothed);
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
+  geometry: habitatPolygons.geometry(), scale: 10, maxPixels: 1e13
+});
+
+var mappedStats = ee.List(areas.get('groups')).map(function(item) {
+  var dict = ee.Dictionary(item);
+  var classId = ee.Number(dict.get('class')).toInt();
+  return ee.Feature(null, {
+    'Habitat': classNames.get(classId.subtract(1)),
+    'Area': ee.Number(dict.get('sum')).divide(10000),
+    'Type': 'Mapped'
+  });
+});
+
+var referenceStats = ee.FeatureCollection(classNames.map(function(code) {
+  return ee.Feature(null, {
+    'Habitat': code,
+    'Area': habitatsMapped.filter(ee.Filter.eq('HCH_MAPPED', code)).geometry().area().divide(10000),
+    'Type': 'Actual'
+  });
+}));
+
+// =================================================================
+// 5. VISUALIZATION & CHARTS
+// =================================================================
+Map.centerObject(habitatPolygons, 15);
+Map.addLayer(smoothed, {min: 1, max: 9, palette: bogPalette}, 'Habitats');
+
+var combined = ee.FeatureCollection(mappedStats).merge(referenceStats);
+print(ui.Chart.feature.groups({
+  features: combined, xProperty: 'Habitat', yProperty: 'Area', seriesProperty: 'Type'
+}).setChartType('ColumnChart').setOptions({
+  title: 'Mapped vs Actual Habitat Area (Ha)',
+  colors: ['#808080', '#228B22']
+}));
+
+// Training Accuracy Evaluation
+var trainAccuracyMatrix = classifier.confusionMatrix();
+print('--- TRAINING ACCURACY (Internal) ---');
+print('Training Accuracy:', trainAccuracyMatrix.accuracy());
+print('Training Kappa:', trainAccuracyMatrix.kappa());
+
+// =================================================================
+// 6. ACCURACY REPORTING & DETAILED PER-CLASS METRICS (VALIDATION SET)
+// =================================================================
+var validated = validationSamples.classify(classifier);
+var errorMatrix = validated.errorMatrix('habitat_num', 'classification', habitatIDs);
+
+print('--- FINAL VALIDATION SUMMARY ---');
+errorMatrix.accuracy().evaluate(function(val) {
+  print('Overall Accuracy: ' + (val * 100).toFixed(2) + '%');
+});
+
+errorMatrix.kappa().evaluate(function(val) {
+  print('Kappa Coefficient: ' + val.toFixed(4));
+});
+
+var cmArray = ee.Array(errorMatrix.array());
+
+// Safely evaluate class names and confusion matrix on the client side
+classNames.evaluate(function(names) {
+  cmArray.evaluate(function(matrix) {
+    print('--- PER-CLASS METRICS BREAKDOWN (N, PA, UA, F1) ---');
+    names.forEach(function(name, i) {
+      var rowSum = 0; 
+      var colSum = 0; 
+      var correct = matrix[i][i]; 
+
+      for (var j = 0; j < names.length; j++) {
+        rowSum += matrix[i][j];
+        colSum += matrix[j][i];
+      }
+
+      var paDec = (rowSum > 0) ? (correct / rowSum) : 0;
+      var uaDec = (colSum > 0) ? (correct / colSum) : 0;
+      var f1Score = (paDec + uaDec > 0) ? (2 * paDec * uaDec) / (paDec + uaDec) : 0;
+
+      var paStr = (rowSum > 0) ? (paDec * 100).toFixed(2) + '%' : 'N/A';
+      var uaStr = (colSum > 0) ? (uaDec * 100).toFixed(2) + '%' : 'N/A';
+
+      print(name + ' [N = ' + rowSum + '] -> Producer\'s: ' + paStr + 
+            ' | User\'s: ' + uaStr + 
+            ' | F1-Score: ' + f1Score.toFixed(4));
+    });
+
+    // =================================================================
+    // 7. FORMATTED CONFUSION MATRIX TABLE DISPLAY
+    // =================================================================
+    print('--- CONFUSION MATRIX TABLE (Actual Rows vs Predicted Columns) ---');
+    var header = 'Actual \\ Pred\t' + names.join('\t');
+    print(header);
+    matrix.forEach(function(row, i) {
+      var rowString = names[i] + '\t\t' + row.join('\t');
+      print(rowString);
+    });
+  });
+});
