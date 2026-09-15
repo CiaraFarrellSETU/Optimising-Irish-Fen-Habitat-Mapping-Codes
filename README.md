@@ -1,6 +1,7 @@
 # Optimising-Irish-Fen-Habitat-Mapping-Codes
 This repository contains the source code, scripts, and analytical workflows developed for optimising the mapping and monitoring of Irish fen habitats. Fens are complex, groundwater-fed wetland ecosystems of high conservation value under the EU Habitats Directive
 
+
 In all codes the date range, spectral features combos and data splits can be edited to look at different temporal windows, feature sets and data splits
 
   
@@ -47,3 +48,20 @@ Ballymore_growing
 * **Random Forest Modeling & Post-Processing:** Fits a 250-tree Random Forest classifier and reduces spatial noise via a 3x3 filter.
 * **Detailed Accuracy Assessment:** Evaluates validation and internal training performance (Overall Accuracy, Kappa) alongside per-class Producer's and User's Accuracy metrics.
 * **Formatted Diagnostics:** Outputs an aligned 8x8 confusion matrix table directly into the GEE console and prints unique vector asset codes for validation.
+
+
+Ballymore_lowcloud
+* **Growing Season Median Compositing:** Generates a cloud-free composite from  Sentinel-2 imagery clipped to polygon bounds.
+* **Feature Engineering:** Combines 4 optical bands with an 8-index spectral stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`).
+* **Stratified Sampling:** Samples pixel regions at 5m resolution and enforces an 80/20 train/validation split per class.
+* **Random Forest Modeling & Post-Processing:** Fits a 250-tree Random Forest classifier and reduces spatial noise via a 3x3 filter.
+* **Detailed Accuracy Assessment:** Evaluates validation and internal training performance (Overall Accuracy, Kappa) alongside per-class Producer's and User's Accuracy metrics.
+* **Formatted Diagnostics:** Outputs an aligned 8x8 confusion matrix table directly into the GEE console and prints unique vector asset codes for validation.
+
+
+Ballymore_stats
+* **Band Scaling & Feature Engineering:** Scales raw Sentinel-2 bands to properly calculate clamped vegetation and water indices (`NDVI`, `RVI`, `GNDVI`, `SAVI`, `EVI`, `GRVI`, `NRVI`, `NDWI`).
+* **Feature Integration:** Stacks 4 optical bands (B2, B3, B4, B8) with the 8 calculated spectral indices into a 12-band classification image.
+* **Random Forest Classification:** Samples regions at 5m resolution and splits data 80/20 into training and validation sets for a 250-tree Random Forest model.
+* **Accuracy Validation & Binary Scoring:** Classifies unseen test pixels and programmatically generates a binary correctness indicator (`is_correct`) comparing actual vs. predicted habitat IDs.
+* **Direct CSV Export:** Dynamically generates and prints a direct download link for the validation results CSV (`habitat_num`, `is_correct`), enabling rapid external performance auditing.
