@@ -3,6 +3,7 @@ This repository contains the source code, scripts, and analytical workflows deve
 
 In all codes the date range, spectral features combos and data splits can be edited to look at different temporal windows, feature sets and data splits
 
+  
 BallyStrat
 * **Data Preprocessing:** Maps string-based Fossitt habitat codes (`GM1`, `PB1`, `PF1`, etc.) to numerical targets.
 * **Feature Engineering:** Generates an 8-band spectral index stack (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`) combined with Sentinel-2 optical bands.
@@ -10,6 +11,7 @@ BallyStrat
 * **Classification & Post-Processing:** Trains a 250-tree Random Forest model and applies 3x3 filtering to reduce pixel noise.
 * **Validation:** Calculates Overall Accuracy, Kappa Coefficient, F1-Scores, Producer's/User's Accuracy, and outputs a formatted Confusion Matrix.
 
+  
   Ballymore
 * **Data Mapping:** Converts string-based Fossitt habitat codes to numeric identifiers for machine learning compatibility.
 * **Spectral Feature Engineering:** Constructs a 12-band input stack combining raw optical bands with 8 vegetation and moisture indices (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`).
@@ -18,6 +20,7 @@ BallyStrat
 * **Model Validation:** Computes training/validation accuracy, Producer's & User's accuracy, Kappa coefficient, and full confusion matrices to evaluate model performance and overfitting.
 * **Habitat Area Reporting:** Automatically calculates vector coverage metrics, outputting precise per-class spatial statistics in hectares and percentages.
 
+  
 Ballymore_5.no
 * **Data Harmonization & Band Scaling:** Standardizes string-based Fossitt habitat codes to numeric identifiers and scales raw Sentinel-2 reflectance values.
 * **Spectral Indices Engineering:** Builds a 12-band stack combining optical bands with 8 spectral indices (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`).
@@ -27,6 +30,7 @@ Ballymore_5.no
 * **Automated Area Analytics & UI Charts:** Dynamically calculates spatial coverage (hectares and percentages) and renders UI column/pie charts for habitat composition.
 * **Spectral Distribution Profiling & CSV Export:** Generates custom 5-number summary interval boxplots (Min, P_{25}, Median, P_{75}, Max) across classes and outputs a direct CSV download URL for pixel-level data.
 
+  
 Ballymore_bestscene
 * **Optimal Scene Selection:** Queries the 2019–2020 Sentinel-2 repository to programmatically select, clip, and process the single clearest scene (lowest cloud cover percentage).
 * **Spectral Indices Engineering:** Generates an 8-band index stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`) combined with raw Sentinel-2 optical bands ($B2, B3, B4, B8$).
@@ -35,6 +39,7 @@ Ballymore_bestscene
 * **Spatial Smoothing & Map Display:** Filters out spatial noise using a 3x3 filter.
 * **Overfitting & Validation Diagnostics:** Calculates and compares internal training accuracy against unseen validation accuracy, Kappa coefficient, and confusion matrices.
 
+  
 Ballymore_growing
 * **Growing Season Median Compositing:** Generates a cloud-free composite from summer 2020 Sentinel-2 imagery clipped to polygon bounds.
 * **Feature Engineering:** Combines 4 optical bands with an 8-index spectral stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`).
