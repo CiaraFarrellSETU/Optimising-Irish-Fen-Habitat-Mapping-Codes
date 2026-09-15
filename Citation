@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "Optimising Irish Fen Habitat Mapping Codes"
+message: "If you use this software or code, please cite it as below."
+type: software
+authors:
+  - family-names: "Farrell"
+    given-names: "Ciara"
+    # orcid: "https://orcid.org/0009-0008-5137-173X"
+repository-code: "https://github.com/CiaraFarrellSETU/Optimising-Irish-Fen-Habitat-Mapping-Codes/tree/main"
+date-released: 2026-09-15
+# Optional: add manuscript DOI once published
+# preferred-citation:
+#   type: article
+#   authors: ...
+#   title: "..."
+#   journal: "..."
+#   year: 2026
