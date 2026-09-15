@@ -6,7 +6,7 @@ In all codes the date range, spectral features combos and data splits can be edi
 
   
 BallyStrat
-* **Data Preprocessing:** Maps string-based Fossitt habitat codes (`GM1`, `PB1`, `PF1`, etc.) to numerical targets.
+* **Data Preprocessing:** Maps string-based Fossitt habitat codes to numerical targets.
 * **Feature Engineering:** Generates an 8-band spectral index stack (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`) combined with Sentinel-2 optical bands.
 * **Stratified Sampling:** Executes an 80/20 train/validation split per class to handle class imbalance.
 * **Classification & Post-Processing:** Trains a 250-tree Random Forest model and applies 3x3 filtering to reduce pixel noise.
