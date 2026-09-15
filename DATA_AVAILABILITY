@@ -1,0 +1,22 @@
+# Data & Asset Availability Statement
+
+## 1. Primary Vector & Ground Truth Data
+The habitat vector polygons and ground truth training/validation data used in this study originate from **The Pilot Fen Survey 2019–2020**. 
+
+* **Source:** National Parks and Wildlife Service (NPWS), Ireland.
+* **Access Restrictions:** These data were provided under specific license/permission for this research and are not publicly available. 
+* **Data Access Requests:** External researchers seeking access to these datasets should direct inquiries directly to the NPWS at:  
+  `NPWS_Data@npws.gov.ie`
+
+---
+
+## 2. Satellite & Topographic Data Inputs
+All satellite imagery utilized across the workflows are freely accessible public datasets hosted directly on Google Earth Engine (GEE):
+
+* **Sentinel-2 Surface Reflectance:** `COPERNICUS/S2_SR_HARMONIZED` (European Space Agency / Copernicus Programme)
+ 
+
+To run the provided scripts independently:
+1. Obtain permission and access to the vector survey datasets from the NPWS.
+2. Upload the shapefiles to your personal Google Earth Engine Asset repository.
+3. Update the corresponding `ee.FeatureCollection()` asset paths at the top of each script to match your local GEE asset IDs.
