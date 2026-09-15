@@ -1,11 +1,12 @@
 # Optimising-Irish-Fen-Habitat-Mapping-Codes
 This repository contains the source code, scripts, and analytical workflows developed for optimising the mapping and monitoring of Irish fen habitats. Fens are complex, groundwater-fed wetland ecosystems of high conservation value under the EU Habitats Directive
 
-
-In all codes the date range, spectral features combos and data splits can be edited to look at different temporal windows, feature sets and data splits
-
+> **Note on Implementation & Manuscript:**  
+> All scripts in this repository were developed and evaluated as part of the broader project research workflow. However, the **Site-Wide Stratified Pipeline** represents the final, optimized methodology selected and detailed in the accompanying manuscript.
+In all scripts, the **date ranges**, **spectral feature combinations**, and **data split ratios** can be customized to evaluate different temporal windows, feature sets, and sampling strategies across all study sites.
+## 📁 Repository Structure & Workflows
   
-BallyStrat
+BallyStrat/LiskeenanStrat/ScraghStrat [Site-Wide Stratified Pipeline]
 * **Data Preprocessing:** Maps string-based Fossitt habitat codes to numerical targets.
 * **Feature Engineering:** Generates an 8-band spectral index stack (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`) combined with Sentinel-2 optical bands.
 * **Stratified Sampling:** Executes an 80/20 train/validation split per class to handle class imbalance.
@@ -13,7 +14,7 @@ BallyStrat
 * **Validation:** Calculates Overall Accuracy, Kappa Coefficient, F1-Scores, Producer's/User's Accuracy, and outputs a formatted Confusion Matrix.
 
   
-  Ballymore
+  Ballymore/Liskeenan/Scragh [Standard Baseline Workflow]
 * **Data Mapping:** Converts string-based Fossitt habitat codes to numeric identifiers for machine learning compatibility.
 * **Spectral Feature Engineering:** Constructs a 12-band input stack combining raw optical bands with 8 vegetation and moisture indices (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`).
 * **Random Forest Classification:** Trains a 250-tree Random Forest classifier using high-resolution spatial sampling (5m).
@@ -22,7 +23,7 @@ BallyStrat
 * **Habitat Area Reporting:** Automatically calculates vector coverage metrics, outputting precise per-class spatial statistics in hectares and percentages.
 
   
-Ballymore_5.no
+Ballymore_5.no/Liskeenan_5.no/Scragh_5.no [Comprehensive Analytics & UI Pipeline]
 * **Data Harmonization & Band Scaling:** Standardizes string-based Fossitt habitat codes to numeric identifiers and scales raw Sentinel-2 reflectance values.
 * **Spectral Indices Engineering:** Builds a 12-band stack combining optical bands with 8 spectral indices (`NDVI`, `SAVI`, `EVI`, `NDWI`, `GNDVI`, `GRVI`, `RVI`, `NRVI`).
 * **Random Forest Modeling:** Samples regions at 5m resolution and trains a 250-tree Random Forest classifier on an 80/20 train/validation split.
@@ -32,7 +33,7 @@ Ballymore_5.no
 * **Spectral Distribution Profiling & CSV Export:** Generates custom 5-number summary interval boxplots (Min, P_{25}, Median, P_{75}, Max) across classes and outputs a direct CSV download URL for pixel-level data.
 
   
-Ballymore_bestscene
+Ballymore_bestscene/Liskeenan_bestscene/Scragh_bestscene [Single Optimal Scene Workflow]
 * **Optimal Scene Selection:** Queries the 2019–2020 Sentinel-2 repository to programmatically select, clip, and process the single clearest scene (lowest cloud cover percentage).
 * **Spectral Indices Engineering:** Generates an 8-band index stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`) combined with raw Sentinel-2 optical bands ($B2, B3, B4, B8$).
 * **Data Harmonization:** Converts string-based Fossitt habitat codes to numeric identifiers for Random Forest compatibility.
@@ -41,7 +42,7 @@ Ballymore_bestscene
 * **Overfitting & Validation Diagnostics:** Calculates and compares internal training accuracy against unseen validation accuracy, Kappa coefficient, and confusion matrices.
 
   
-Ballymore_growing
+Ballymore_growing/Liskeenan_growing/Scragh_growing [Growing Season Composites]
 * **Growing Season Median Compositing:** Generates a cloud-free composite from summer 2020 Sentinel-2 imagery clipped to polygon bounds.
 * **Feature Engineering:** Combines 4 optical bands with an 8-index spectral stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`).
 * **Stratified Sampling:** Samples pixel regions at 5m resolution and enforces an 80/20 train/validation split per class.
@@ -50,7 +51,7 @@ Ballymore_growing
 * **Formatted Diagnostics:** Outputs an aligned 8x8 confusion matrix table directly into the GEE console and prints unique vector asset codes for validation.
 
 
-Ballymore_lowcloud
+Ballymore_lowcloud/Liskeenan_lowcloud/Scragh_lowcloud [Low-Cloud Composite Pipeline]
 * **Growing Season Median Compositing:** Generates a cloud-free composite from  Sentinel-2 imagery clipped to polygon bounds.
 * **Feature Engineering:** Combines 4 optical bands with an 8-index spectral stack (`NDVI`, `RVI`, `SAVI`, `EVI`, `GNDVI`, `GRVI`, `NRVI`, `NDWI`).
 * **Stratified Sampling:** Samples pixel regions at 5m resolution and enforces an 80/20 train/validation split per class.
@@ -59,7 +60,7 @@ Ballymore_lowcloud
 * **Formatted Diagnostics:** Outputs an aligned 8x8 confusion matrix table directly into the GEE console and prints unique vector asset codes for validation.
 
 
-Ballymore_stats
+Ballymore_stats/Liskeenan_stats/Scragh_stats [Validation & Direct Export Diagnostics]
 * **Band Scaling & Feature Engineering:** Scales raw Sentinel-2 bands to properly calculate clamped vegetation and water indices (`NDVI`, `RVI`, `GNDVI`, `SAVI`, `EVI`, `GRVI`, `NRVI`, `NDWI`).
 * **Feature Integration:** Stacks 4 optical bands (B2, B3, B4, B8) with the 8 calculated spectral indices into a 12-band classification image.
 * **Random Forest Classification:** Samples regions at 5m resolution and splits data 80/20 into training and validation sets for a 250-tree Random Forest model.
